@@ -390,6 +390,8 @@ def _crawl_bse(
         Tuple of (total_filings, new_filings, downloaded_count).
     """
     total_f = total_new = total_dl = 0
+    pages_crawled = 0
+    errors: list[str] = []
     search_type = "A" if (from_date or to_date) else "P"
 
     start_page = 1
@@ -405,54 +407,68 @@ def _crawl_bse(
     if from_date or to_date:
         log.info("BSE date filter: %s to %s", from_date or "start", to_date or "now")
 
-    for page_num in range(start_page, start_page + max_pages):
-        if page_num > start_page:
-            time.sleep(DELAY_BETWEEN_PAGES)
+    log_id = cache.log_crawl_start("bse", source="bse")
 
-        try:
-            filings, total_count = fetch_bse_page(
-                session,
-                page_num=page_num,
-                from_date=from_date,
-                to_date=to_date,
-                search_type=search_type,
+    try:
+        for page_num in range(start_page, start_page + max_pages):
+            if page_num > start_page:
+                time.sleep(DELAY_BETWEEN_PAGES)
+
+            try:
+                filings, total_count = fetch_bse_page(
+                    session,
+                    page_num=page_num,
+                    from_date=from_date,
+                    to_date=to_date,
+                    search_type=search_type,
+                )
+            except (requests.RequestException, ValueError) as exc:
+                log.warning("BSE page %d fetch failed: %s — skipping", page_num, exc)
+                errors.append(str(exc))
+                continue
+
+            pages_crawled += 1
+
+            if not filings:
+                log.info("BSE page %d: no filings. Stopping.", page_num)
+                break
+
+            new = cache.insert_batch(filings, page_num)
+            total_f += len(filings)
+            total_new += new
+
+            max_page = (
+                (total_count + BSE_PAGE_SIZE - 1) // BSE_PAGE_SIZE if total_count else "?"
             )
-        except (requests.RequestException, ValueError) as exc:
-            log.warning("BSE page %d fetch failed: %s — skipping", page_num, exc)
-            continue
+            log.info(
+                "BSE page %d/%s: %d filings (%d new) [total: %s]",
+                page_num,
+                max_page,
+                len(filings),
+                new,
+                total_count,
+            )
 
-        if not filings:
-            log.info("BSE page %d: no filings. Stopping.", page_num)
-            break
+            cache.save_crawl_state("bse", "last_page", str(page_num))
 
-        new = cache.insert_batch(filings, page_num)
-        total_f += len(filings)
-        total_new += new
+            if download and filings:
+                dl = download_filings(session, filings, doc_dir, cache, parallel)
+                total_dl += dl
 
-        max_page = (
-            (total_count + BSE_PAGE_SIZE - 1) // BSE_PAGE_SIZE if total_count else "?"
+            if incremental and new == 0 and page_num > start_page:
+                log.info("BSE: no new filings — caught up (--incremental).")
+                break
+            elif not incremental and new == 0 and page_num > start_page + 1:
+                log.info("BSE: no new filings — caught up.")
+                break
+    finally:
+        cache.log_crawl_complete(
+            log_id,
+            filings_found=total_f,
+            filings_new=total_new,
+            pages_crawled=pages_crawled,
+            errors="; ".join(errors) if errors else "",
         )
-        log.info(
-            "BSE page %d/%s: %d filings (%d new) [total: %s]",
-            page_num,
-            max_page,
-            len(filings),
-            new,
-            total_count,
-        )
-
-        cache.save_crawl_state("bse", "last_page", str(page_num))
-
-        if download and filings:
-            dl = download_filings(session, filings, doc_dir, cache, parallel)
-            total_dl += dl
-
-        if incremental and new == 0 and page_num > start_page:
-            log.info("BSE: no new filings — caught up (--incremental).")
-            break
-        elif not incremental and new == 0 and page_num > start_page + 1:
-            log.info("BSE: no new filings — caught up.")
-            break
 
     return total_f, total_new, total_dl
 
@@ -495,45 +511,57 @@ def _crawl_nse(
 
     total_f = total_new = total_dl = 0
 
-    for nse_type in nse_types:
-        log.info("--- NSE: %s ---", nse_type)
+    log_id = cache.log_crawl_start("nse", source="nse")
+    total_errors: list[str] = []
 
-        resume_date = ""
-        if resume:
-            resume_date = cache.get_crawl_state("nse", f"last_date_{nse_type}") or ""
-            if resume_date:
-                log.info("NSE %s: resuming from %s", nse_type, resume_date)
+    try:
+        for nse_type in nse_types:
+            log.info("--- NSE: %s ---", nse_type)
 
-        filings = fetch_nse_paginated(
-            session,
-            max_pages=max_pages,
-            endpoint_type=nse_type,
-            from_date_override=from_date,
-            to_date_override=to_date,
-            resume_date=resume_date,
-        )
-        new = cache.insert_batch(filings)
-        total_f += len(filings)
-        total_new += new
+            resume_date = ""
+            if resume:
+                resume_date = cache.get_crawl_state("nse", f"last_date_{nse_type}") or ""
+                if resume_date:
+                    log.info("NSE %s: resuming from %s", nse_type, resume_date)
 
-        # Persist last fetched date for resume
-        if filings:
-            cache.save_crawl_state(
-                "nse",
-                f"last_date_{nse_type}",
-                datetime.now().strftime("%d-%m-%Y"),
+            filings = fetch_nse_paginated(
+                session,
+                max_pages=max_pages,
+                endpoint_type=nse_type,
+                from_date_override=from_date,
+                to_date_override=to_date,
+                resume_date=resume_date,
             )
+            new = cache.insert_batch(filings)
+            total_f += len(filings)
+            total_new += new
 
-        if download and filings:
-            dl = download_filings(session, filings, doc_dir, cache, parallel)
-            total_dl += dl
+            # Persist last fetched date for resume
+            if filings:
+                cache.save_crawl_state(
+                    "nse",
+                    f"last_date_{nse_type}",
+                    datetime.now().strftime("%d-%m-%Y"),
+                )
 
-        log.info(
-            "NSE %s: %d filings (%d new), %d downloaded",
-            nse_type,
-            len(filings),
-            new,
-            total_dl,
+            if download and filings:
+                dl = download_filings(session, filings, doc_dir, cache, parallel)
+                total_dl += dl
+
+            log.info(
+                "NSE %s: %d filings (%d new), %d downloaded",
+                nse_type,
+                len(filings),
+                new,
+                total_dl,
+            )
+    finally:
+        cache.log_crawl_complete(
+            log_id,
+            filings_found=total_f,
+            filings_new=total_new,
+            pages_crawled=len(nse_types),
+            errors="; ".join(total_errors) if total_errors else "",
         )
 
     return total_f, total_new, total_dl
@@ -573,37 +601,47 @@ def _crawl_sebi(
 
     total_f = total_new = total_dl = 0
 
-    for category in categories:
-        category_id = SEBI_CATEGORIES.get(category, 15)
-        category_name = SEBI_CATEGORY_NAMES.get(category_id, f"Category {category_id}")
-        log.info("--- SEBI: %s ---", category_name)
+    log_id = cache.log_crawl_start("sebi", source="sebi")
 
-        start_page = 0
-        if resume:
-            saved = cache.get_crawl_state("sebi", f"last_page_{category}")
-            if saved:
-                try:
-                    start_page = int(saved) + 1
-                    log.info("SEBI %s: resuming from page %d", category, start_page)
-                except ValueError:
-                    pass
+    try:
+        for category in categories:
+            category_id = SEBI_CATEGORIES.get(category, 15)
+            category_name = SEBI_CATEGORY_NAMES.get(category_id, f"Category {category_id}")
+            log.info("--- SEBI: %s ---", category_name)
 
-        cat_f, cat_new, cat_dl = _crawl_sebi_category(
-            session,
-            cache,
-            doc_dir,
-            max_pages,
-            download,
-            parallel,
-            category_id,
-            category_name,
-            category_key=category,
-            start_page=start_page,
-            incremental=incremental,
+            start_page = 0
+            if resume:
+                saved = cache.get_crawl_state("sebi", f"last_page_{category}")
+                if saved:
+                    try:
+                        start_page = int(saved) + 1
+                        log.info("SEBI %s: resuming from page %d", category, start_page)
+                    except ValueError:
+                        pass
+
+            cat_f, cat_new, cat_dl = _crawl_sebi_category(
+                session,
+                cache,
+                doc_dir,
+                max_pages,
+                download,
+                parallel,
+                category_id,
+                category_name,
+                category_key=category,
+                start_page=start_page,
+                incremental=incremental,
+            )
+            total_f += cat_f
+            total_new += cat_new
+            total_dl += cat_dl
+    finally:
+        cache.log_crawl_complete(
+            log_id,
+            filings_found=total_f,
+            filings_new=total_new,
+            pages_crawled=len(categories),
         )
-        total_f += cat_f
-        total_new += cat_new
-        total_dl += cat_dl
 
     return total_f, total_new, total_dl
 
@@ -922,34 +960,40 @@ def cmd_export(args: argparse.Namespace) -> int:
 
 def _compute_health(
     total: int,
-    newest: str | None,
+    last_completed_at: str | None,
 ) -> str:
-    """Compute a health status string based on filing counts and recency.
+    """Compute a health status string based on filing counts and crawl recency.
+
+    Uses the most recent crawl completion timestamp from crawl_log to determine
+    freshness.  The 48-hour threshold is the primary signal; the filing-date
+    fallback (newest) is no longer used.
 
     Health levels:
       - "empty":    no filings at all
-      - "ok":       filings present and latest record is within 3 days
-      - "stale":    filings present but latest record is older than 3 days
-      - "degraded": filings present but latest record is older than 30 days
-      - "error":    cannot determine (missing date)
+      - "ok":       a completed crawl exists within the last 48 hours
+      - "stale":    last completed crawl was between 48 hours and 30 days ago
+      - "degraded": last completed crawl was more than 30 days ago
+      - "error":    cannot determine (no completed crawl, or unparseable timestamp)
 
     Args:
         total: Total number of filings in the DB.
-        newest: ISO date string (YYYY-MM-DD) of the most recent filing, or None.
+        last_completed_at: ISO datetime string of the most recent completed crawl
+            from crawl_log.completed_at, or None when no completed crawl exists.
 
     Returns:
         Health status string.
     """
     if total == 0:
         return "empty"
-    if not newest:
+    if not last_completed_at:
         return "error"
 
     try:
-        newest_dt = datetime.strptime(newest[:10], "%Y-%m-%d")
-        age_days = (datetime.now() - newest_dt).days
-        if age_days <= 3:
+        completed_dt = datetime.fromisoformat(last_completed_at)
+        age_hours = (datetime.now() - completed_dt).total_seconds() / 3600
+        if age_hours <= 48:
             return "ok"
+        age_days = age_hours / 24
         if age_days <= 30:
             return "stale"
         return "degraded"
@@ -1009,7 +1053,8 @@ def cmd_stats(args: argparse.Namespace) -> int:
 
             unique_companies = cache.unique_companies()
             crawl_runs = cache.total_crawl_runs()
-            health = _compute_health(total, newest)
+            last_completed_at = cache.last_crawl_completed_at()
+            health = _compute_health(total, last_completed_at)
 
             output = {
                 "scraper": "india-scraper",

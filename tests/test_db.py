@@ -25,6 +25,8 @@ import pytest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 
+from datetime import datetime, timedelta
+
 from db import FilingCache, _SCHEMA
 
 
@@ -581,3 +583,160 @@ class TestL2ToL3Migration:
         assert "ticker" in col_names
         # Must NOT have L2 cols
         assert "symbol" not in col_names
+
+
+# ===========================================================================
+# crawl_log
+# ===========================================================================
+
+
+class TestCrawlLog:
+    """Tests for crawl_log table and log_crawl_start / log_crawl_complete."""
+
+    def test_crawl_log_table_created(self, tmp_db):
+        """The 'crawl_log' table exists after FilingCache.__init__."""
+        row = tmp_db.conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name='crawl_log'"
+        ).fetchone()
+        assert row is not None
+
+    def test_crawl_log_columns_present(self, tmp_db):
+        """crawl_log has all required columns from the spec."""
+        info = tmp_db.conn.execute("PRAGMA table_info(crawl_log)").fetchall()
+        col_names = {row[1] for row in info}
+        required = {
+            "id", "crawl_type", "source", "query_params",
+            "filings_found", "filings_new", "pages_crawled",
+            "errors", "started_at", "completed_at", "duration_seconds",
+        }
+        missing = required - col_names
+        assert not missing, f"Missing crawl_log columns: {missing}"
+
+    def test_log_crawl_start_returns_int(self, tmp_db):
+        """log_crawl_start returns a positive integer row id."""
+        log_id = tmp_db.log_crawl_start("bse", source="bse")
+        assert isinstance(log_id, int)
+        assert log_id > 0
+
+    def test_log_crawl_start_stores_started_at(self, tmp_db):
+        """log_crawl_start populates started_at with an ISO timestamp."""
+        before = datetime.now()
+        log_id = tmp_db.log_crawl_start("bse", source="bse")
+        after = datetime.now()
+        row = tmp_db.conn.execute(
+            "SELECT started_at FROM crawl_log WHERE id=?", (log_id,)
+        ).fetchone()
+        started_dt = datetime.fromisoformat(row[0])
+        assert before <= started_dt <= after
+
+    def test_log_crawl_start_completed_at_is_null(self, tmp_db):
+        """completed_at is NULL until log_crawl_complete is called."""
+        log_id = tmp_db.log_crawl_start("bse", source="bse")
+        row = tmp_db.conn.execute(
+            "SELECT completed_at FROM crawl_log WHERE id=?", (log_id,)
+        ).fetchone()
+        assert row[0] is None
+
+    def test_log_crawl_complete_sets_completed_at(self, tmp_db):
+        """log_crawl_complete populates completed_at."""
+        log_id = tmp_db.log_crawl_start("bse", source="bse")
+        before = datetime.now()
+        tmp_db.log_crawl_complete(log_id, filings_found=10, filings_new=5)
+        after = datetime.now()
+        row = tmp_db.conn.execute(
+            "SELECT completed_at FROM crawl_log WHERE id=?", (log_id,)
+        ).fetchone()
+        completed_dt = datetime.fromisoformat(row[0])
+        assert before <= completed_dt <= after
+
+    def test_log_crawl_complete_stores_counts(self, tmp_db):
+        """log_crawl_complete persists filings_found, filings_new, pages_crawled."""
+        log_id = tmp_db.log_crawl_start("nse", source="nse")
+        tmp_db.log_crawl_complete(
+            log_id, filings_found=50, filings_new=20, pages_crawled=4
+        )
+        row = tmp_db.conn.execute(
+            "SELECT filings_found, filings_new, pages_crawled FROM crawl_log WHERE id=?",
+            (log_id,),
+        ).fetchone()
+        assert row[0] == 50
+        assert row[1] == 20
+        assert row[2] == 4
+
+    def test_log_crawl_complete_stores_errors(self, tmp_db):
+        """log_crawl_complete persists errors string."""
+        log_id = tmp_db.log_crawl_start("sebi", source="sebi")
+        tmp_db.log_crawl_complete(log_id, errors="timeout on page 3")
+        row = tmp_db.conn.execute(
+            "SELECT errors FROM crawl_log WHERE id=?", (log_id,)
+        ).fetchone()
+        assert row[0] == "timeout on page 3"
+
+    def test_log_crawl_complete_stores_duration(self, tmp_db):
+        """log_crawl_complete calculates and stores duration_seconds >= 0."""
+        log_id = tmp_db.log_crawl_start("bse", source="bse")
+        tmp_db.log_crawl_complete(log_id)
+        row = tmp_db.conn.execute(
+            "SELECT duration_seconds FROM crawl_log WHERE id=?", (log_id,)
+        ).fetchone()
+        assert row[0] is not None
+        assert row[0] >= 0
+
+    def test_last_crawl_completed_at_none_when_empty(self, tmp_db):
+        """Returns None when no completed crawl exists."""
+        assert tmp_db.last_crawl_completed_at() is None
+
+    def test_last_crawl_completed_at_none_when_only_started(self, tmp_db):
+        """Returns None when a crawl was started but not completed."""
+        tmp_db.log_crawl_start("bse", source="bse")
+        assert tmp_db.last_crawl_completed_at() is None
+
+    def test_last_crawl_completed_at_returns_iso_string(self, tmp_db):
+        """Returns an ISO datetime string after a completed crawl."""
+        log_id = tmp_db.log_crawl_start("bse", source="bse")
+        tmp_db.log_crawl_complete(log_id)
+        result = tmp_db.last_crawl_completed_at()
+        assert result is not None
+        # Must be parseable as ISO datetime
+        datetime.fromisoformat(result)
+
+    def test_last_crawl_completed_at_returns_most_recent(self, tmp_db):
+        """Returns the most recent completed_at when multiple entries exist."""
+        id1 = tmp_db.log_crawl_start("bse", source="bse")
+        tmp_db.log_crawl_complete(id1)
+        id2 = tmp_db.log_crawl_start("nse", source="nse")
+        tmp_db.log_crawl_complete(id2)
+        result = tmp_db.last_crawl_completed_at()
+        # The second entry's completed_at should be >= the first
+        id1_row = tmp_db.conn.execute(
+            "SELECT completed_at FROM crawl_log WHERE id=?", (id1,)
+        ).fetchone()
+        assert result >= id1_row[0]
+
+    def test_last_crawl_completed_at_source_filter(self, tmp_db):
+        """Source filter returns only that source's most recent completed crawl."""
+        id_bse = tmp_db.log_crawl_start("bse", source="bse")
+        tmp_db.log_crawl_complete(id_bse)
+        assert tmp_db.last_crawl_completed_at("bse") is not None
+        assert tmp_db.last_crawl_completed_at("nse") is None
+
+    def test_total_crawl_runs_uses_crawl_log(self, tmp_db):
+        """total_crawl_runs counts completed crawl_log entries, not crawl_state rows."""
+        id1 = tmp_db.log_crawl_start("bse", source="bse")
+        tmp_db.log_crawl_complete(id1)
+        id2 = tmp_db.log_crawl_start("nse", source="nse")
+        tmp_db.log_crawl_complete(id2)
+        assert tmp_db.total_crawl_runs() == 2
+
+    def test_total_crawl_runs_ignores_incomplete(self, tmp_db):
+        """total_crawl_runs does not count started-but-not-completed crawls."""
+        id1 = tmp_db.log_crawl_start("bse", source="bse")
+        tmp_db.log_crawl_complete(id1)
+        tmp_db.log_crawl_start("nse", source="nse")  # never completed
+        assert tmp_db.total_crawl_runs() == 1
+
+    def test_total_crawl_runs_legacy_fallback(self, tmp_db):
+        """When crawl_log is empty, falls back to crawl_state row count."""
+        tmp_db.save_crawl_state("bse", "last_page", "3")
+        tmp_db.save_crawl_state("nse", "last_date_announcements", "01-01-2024")
+        assert tmp_db.total_crawl_runs() == 2

@@ -19,7 +19,7 @@ log = logging.getLogger("india-scraper")
 DB_FILE = "filings_cache.db"
 
 
-@dataclass
+@dataclass(frozen=True)
 class Filing:
     """Normalized filing record shared across BSE, NSE, and SEBI sources."""
 
@@ -133,6 +133,22 @@ CREATE TABLE IF NOT EXISTS crawl_state (
     updated_at TEXT NOT NULL,
     UNIQUE(source, key)
 );
+
+CREATE TABLE IF NOT EXISTS crawl_log (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    crawl_type TEXT NOT NULL,
+    source TEXT,
+    query_params TEXT,
+    filings_found INTEGER DEFAULT 0,
+    filings_new INTEGER DEFAULT 0,
+    pages_crawled INTEGER DEFAULT 0,
+    errors TEXT,
+    started_at TEXT NOT NULL,
+    completed_at TEXT,
+    duration_seconds REAL
+);
+CREATE INDEX IF NOT EXISTS idx_crawl_log_completed_at ON crawl_log(completed_at);
+CREATE INDEX IF NOT EXISTS idx_crawl_log_source ON crawl_log(source);
 """
 
 _INSERT_SQL = """
@@ -393,6 +409,76 @@ class FilingCache:
         )
         self.conn.commit()
 
+    def log_crawl_start(
+        self,
+        crawl_type: str,
+        source: str = "",
+        query_params: str = "",
+    ) -> int:
+        """Insert a crawl_log row at the start of a crawl run.
+
+        Args:
+            crawl_type: Human-readable label (e.g. 'bse', 'nse_announcements').
+            source: Source key ('bse', 'nse', 'sebi').
+            query_params: Optional JSON string of query parameters used.
+
+        Returns:
+            Row id of the new crawl_log entry (pass to log_crawl_complete).
+        """
+        cur = self.conn.execute(
+            """INSERT INTO crawl_log
+               (crawl_type, source, query_params, started_at)
+               VALUES (?, ?, ?, ?)""",
+            (crawl_type, source, query_params, datetime.now().isoformat()),
+        )
+        self.conn.commit()
+        return cur.lastrowid  # type: ignore[return-value]
+
+    def log_crawl_complete(
+        self,
+        log_id: int,
+        filings_found: int = 0,
+        filings_new: int = 0,
+        pages_crawled: int = 0,
+        errors: str = "",
+    ) -> None:
+        """Update a crawl_log row when the crawl finishes.
+
+        Args:
+            log_id: Row id returned by log_crawl_start.
+            filings_found: Total filings seen during the crawl.
+            filings_new: Count of newly inserted filings.
+            pages_crawled: Number of pages / date windows fetched.
+            errors: Optional error summary string.
+        """
+        started_row = self.conn.execute(
+            "SELECT started_at FROM crawl_log WHERE id=?", (log_id,)
+        ).fetchone()
+        duration: Optional[float] = None
+        if started_row:
+            try:
+                started_dt = datetime.fromisoformat(started_row[0])
+                duration = (datetime.now() - started_dt).total_seconds()
+            except ValueError:
+                pass
+
+        self.conn.execute(
+            """UPDATE crawl_log
+               SET filings_found=?, filings_new=?, pages_crawled=?,
+                   errors=?, completed_at=?, duration_seconds=?
+               WHERE id=?""",
+            (
+                filings_found,
+                filings_new,
+                pages_crawled,
+                errors or None,
+                datetime.now().isoformat(),
+                duration,
+                log_id,
+            ),
+        )
+        self.conn.commit()
+
     def save_crawl_state(self, source: str, key: str, value: str) -> None:
         """Persist a crawl resume state key-value pair.
 
@@ -486,10 +572,43 @@ class FilingCache:
         ).fetchone()
         return int(row[0] or 0)
 
+    def last_crawl_completed_at(self, source: str = "") -> Optional[str]:
+        """Return the ISO datetime of the most recent completed crawl.
+
+        Args:
+            source: Filter by source key. Empty string checks all sources.
+
+        Returns:
+            ISO datetime string of the latest completed_at, or None if no
+            completed crawl exists.
+        """
+        if source:
+            row = self.conn.execute(
+                """SELECT MAX(completed_at) FROM crawl_log
+                   WHERE source=? AND completed_at IS NOT NULL""",
+                (source,),
+            ).fetchone()
+        else:
+            row = self.conn.execute(
+                "SELECT MAX(completed_at) FROM crawl_log WHERE completed_at IS NOT NULL"
+            ).fetchone()
+        return row[0] if row and row[0] else None
+
     def total_crawl_runs(self) -> int:
-        """Return count of distinct crawl_state updates (proxy for crawl runs)."""
-        row = self.conn.execute("SELECT COUNT(*) FROM crawl_state").fetchone()
-        return int(row[0] or 0)
+        """Return count of completed crawl runs recorded in crawl_log.
+
+        Falls back to counting crawl_state rows when crawl_log is empty
+        (e.g. a DB that was populated before crawl_log was introduced).
+        """
+        row = self.conn.execute(
+            "SELECT COUNT(*) FROM crawl_log WHERE completed_at IS NOT NULL"
+        ).fetchone()
+        count = int(row[0] or 0)
+        if count == 0:
+            # Legacy fallback: crawl_state rows as proxy for crawl runs
+            legacy_row = self.conn.execute("SELECT COUNT(*) FROM crawl_state").fetchone()
+            return int(legacy_row[0] or 0)
+        return count
 
     def export_json(self, path: str, source: str = "") -> None:
         """Export all filings to a JSON file.

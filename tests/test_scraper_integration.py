@@ -436,41 +436,150 @@ class TestCmdStatsJson:
 
 
 class TestComputeHealth:
-    """Tests for _compute_health() health status logic."""
+    """Tests for _compute_health() health status logic (48h crawl_log threshold)."""
 
     def test_empty_when_no_filings(self):
         """Returns 'empty' when total=0."""
         assert _compute_health(0, None) == "empty"
-        assert _compute_health(0, "2024-01-01") == "empty"
+        assert _compute_health(0, datetime.now().isoformat()) == "empty"
 
-    def test_ok_when_recent(self):
-        """Returns 'ok' when newest date is within 3 days."""
-        today = datetime.now().strftime("%Y-%m-%d")
-        assert _compute_health(10, today) == "ok"
+    def test_ok_when_completed_within_48h(self):
+        """Returns 'ok' when last completed crawl is within 48 hours."""
+        recent = (datetime.now() - timedelta(hours=1)).isoformat()
+        assert _compute_health(10, recent) == "ok"
 
-    def test_stale_when_3_to_30_days_old(self):
-        """Returns 'stale' when newest date is 4-30 days old."""
-        stale_date = (datetime.now() - timedelta(days=10)).strftime("%Y-%m-%d")
-        assert _compute_health(10, stale_date) == "stale"
+    def test_ok_boundary_at_48h(self):
+        """Returns 'ok' at exactly 48 hours ago."""
+        exactly_48h = (datetime.now() - timedelta(hours=47, minutes=59)).isoformat()
+        assert _compute_health(10, exactly_48h) == "ok"
+
+    def test_stale_when_48h_to_30_days_old(self):
+        """Returns 'stale' when last crawl was between 48h and 30 days ago."""
+        stale = (datetime.now() - timedelta(days=10)).isoformat()
+        assert _compute_health(10, stale) == "stale"
 
     def test_degraded_when_over_30_days_old(self):
-        """Returns 'degraded' when newest date is >30 days old."""
-        old_date = (datetime.now() - timedelta(days=60)).strftime("%Y-%m-%d")
-        assert _compute_health(10, old_date) == "degraded"
+        """Returns 'degraded' when last crawl was >30 days ago."""
+        old = (datetime.now() - timedelta(days=60)).isoformat()
+        assert _compute_health(10, old) == "degraded"
 
-    def test_error_when_date_missing(self):
-        """Returns 'error' when total > 0 but newest is None/empty."""
+    def test_error_when_no_completed_crawl(self):
+        """Returns 'error' when total > 0 but no completed crawl timestamp."""
         assert _compute_health(5, None) == "error"
         assert _compute_health(5, "") == "error"
 
-    def test_error_when_date_unparseable(self):
-        """Returns 'error' when newest date is not a valid date string."""
-        assert _compute_health(5, "not-a-date") == "error"
+    def test_error_when_timestamp_unparseable(self):
+        """Returns 'error' when the timestamp is not a valid ISO datetime."""
+        assert _compute_health(5, "not-a-datetime") == "error"
 
-    def test_ok_uses_today_correctly(self):
-        """A filing from today has health='ok'."""
-        today = datetime.now().strftime("%Y-%m-%d")
-        assert _compute_health(1, today) == "ok"
+    def test_ok_when_just_completed(self):
+        """A crawl completed moments ago has health='ok'."""
+        just_now = datetime.now().isoformat()
+        assert _compute_health(1, just_now) == "ok"
+
+    def test_stale_just_over_48h(self):
+        """Returns 'stale' when last crawl was just over 48 hours ago."""
+        just_over_48h = (datetime.now() - timedelta(hours=49)).isoformat()
+        assert _compute_health(10, just_over_48h) == "stale"
+
+
+# ===========================================================================
+# crawl_log wiring in crawl helpers
+# ===========================================================================
+
+
+class TestCrawlLogWiring:
+    """Tests that _crawl_bse / _crawl_nse / _crawl_sebi write to crawl_log."""
+
+    def test_crawl_bse_writes_crawl_log(self, tmp_db):
+        """_crawl_bse records a completed crawl_log entry."""
+        def mock_fetch(session, page_num=1, **kwargs):
+            return [], 0  # empty — stops immediately
+
+        with patch("scraper.fetch_bse_page", side_effect=mock_fetch):
+            session = MagicMock()
+            scraper._crawl_bse(
+                session, tmp_db, "/tmp", max_pages=1, download=False, parallel=1
+            )
+
+        assert tmp_db.last_crawl_completed_at("bse") is not None
+
+    def test_crawl_nse_writes_crawl_log(self, tmp_db):
+        """_crawl_nse records a completed crawl_log entry."""
+        with patch("scraper.fetch_nse_paginated", return_value=[]):
+            session = MagicMock()
+            scraper._crawl_nse(
+                session, tmp_db, "/tmp", max_pages=1, download=False, parallel=1
+            )
+
+        assert tmp_db.last_crawl_completed_at("nse") is not None
+
+    def test_crawl_sebi_writes_crawl_log(self, tmp_db):
+        """_crawl_sebi records a completed crawl_log entry."""
+        with patch("scraper.fetch_sebi_page", return_value=([], False)):
+            session = MagicMock()
+            scraper._crawl_sebi(
+                session, tmp_db, "/tmp", max_pages=1, download=False, parallel=1
+            )
+
+        assert tmp_db.last_crawl_completed_at("sebi") is not None
+
+    def test_crawl_bse_log_records_counts(self, tmp_db):
+        """_crawl_bse records correct filings_found and filings_new in crawl_log."""
+        filings_page1 = [
+            {
+                "source": "bse",
+                "filing_id": f"BSE_LOG_{i}",
+                "company_name": f"Co {i}",
+                "filing_date": "2024-01-01",
+                "headline": "Board Meeting Notice",
+            }
+            for i in range(3)
+        ]
+
+        call_count = [0]
+
+        def mock_fetch(session, page_num=1, **kwargs):
+            call_count[0] += 1
+            if call_count[0] == 1:
+                return filings_page1, len(filings_page1)
+            return [], 0
+
+        with patch("scraper.fetch_bse_page", side_effect=mock_fetch):
+            session = MagicMock()
+            scraper._crawl_bse(
+                session, tmp_db, "/tmp", max_pages=3, download=False, parallel=1
+            )
+
+        row = tmp_db.conn.execute(
+            "SELECT filings_found, filings_new FROM crawl_log WHERE source='bse'"
+        ).fetchone()
+        assert row[0] == 3
+        assert row[1] == 3
+
+    def test_health_ok_after_bse_crawl(self, tmp_db, sample_bse_filing):
+        """health='ok' after a BSE crawl completes within 48h."""
+        tmp_db.insert_batch([sample_bse_filing])
+
+        def mock_fetch(session, page_num=1, **kwargs):
+            return [], 0
+
+        with patch("scraper.fetch_bse_page", side_effect=mock_fetch):
+            session = MagicMock()
+            scraper._crawl_bse(
+                session, tmp_db, "/tmp", max_pages=1, download=False, parallel=1
+            )
+
+        last = tmp_db.last_crawl_completed_at()
+        from scraper import _compute_health
+        assert _compute_health(1, last) == "ok"
+
+    def test_health_error_with_filings_but_no_crawl_log(self, tmp_db, sample_bse_filing):
+        """health='error' when filings exist but crawl_log has no completed entry."""
+        tmp_db.insert_batch([sample_bse_filing])
+        last = tmp_db.last_crawl_completed_at()
+        from scraper import _compute_health
+        assert _compute_health(1, last) == "error"
 
 
 # ===========================================================================
