@@ -26,7 +26,9 @@
 *BSE + NSE + SEBI. 7,000+ filings in 6 seconds. Three exchanges, one scraper. Pure HTTP.*
 
 [![Python 3.10+](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/downloads/)
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
+[![License: Proprietary](https://img.shields.io/badge/License-Proprietary-red.svg)](#license)
+
+**Created by Alexander Isaev | [Data Alchemy Labs](https://github.com/itisaevalex)**
 
 </div>
 
@@ -277,3 +279,9 @@ Tested 2026-04-13:
 - Add date-range filtering for BSE
 - Consider `curl_cffi` fallback if Akamai tightens API protection
 - CFDS integration if accessible from Indian IPs
+
+## License
+
+Copyright (c) 2026 Alexander Isaev / Data Alchemy Labs. All rights reserved.
+
+This software is proprietary. See [LICENSE](LICENSE) for details. Commercial use, redistribution, or derivative works require explicit written authorization.
