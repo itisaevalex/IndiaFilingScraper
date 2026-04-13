@@ -1,7 +1,12 @@
 """
 parsers.py — Parsing for all 3 India scraper sources: BSE JSON, NSE JSON, SEBI HTML/#@#.
 
-Also contains classify_filing_type() which works across all sources.
+Also contains classify_filing_type() and date normalization helpers that convert
+each source's native date format to ISO 8601 (YYYY-MM-DD):
+  - BSE:  "DD/MM/YYYY HH:MM:SS"  -> YYYY-MM-DD
+  - NSE:  "DD-Mon-YYYY ..."      -> YYYY-MM-DD  (e.g. "01-Jan-2024 10:00:00")
+  - SEBI: "DD-Mon-YYYY" or
+          "MMM DD, YYYY"          -> YYYY-MM-DD  (e.g. "Jan 10, 2024")
 """
 
 from __future__ import annotations
@@ -15,6 +20,121 @@ from typing import Optional
 from bs4 import BeautifulSoup
 
 log = logging.getLogger("india-scraper")
+
+# ---------------------------------------------------------------------------
+# Date normalization helpers (L3 requirement: all dates stored as YYYY-MM-DD)
+# ---------------------------------------------------------------------------
+
+# Month abbreviation lookup used by NSE and SEBI
+_MONTH_ABBR: dict[str, int] = {
+    "jan": 1, "feb": 2, "mar": 3, "apr": 4, "may": 5, "jun": 6,
+    "jul": 7, "aug": 8, "sep": 9, "oct": 10, "nov": 11, "dec": 12,
+}
+
+
+def normalize_date_bse(raw: str) -> str:
+    """Normalize a BSE date string to ISO 8601 (YYYY-MM-DD).
+
+    BSE format: "DD/MM/YYYY HH:MM:SS"  (space-separated time part optional)
+
+    Args:
+        raw: Raw date string from the BSE API.
+
+    Returns:
+        YYYY-MM-DD string, or the original string if parsing fails.
+    """
+    if not raw:
+        return ""
+    date_part = raw.strip().split(" ")[0]  # "DD/MM/YYYY"
+    try:
+        dt = datetime.strptime(date_part, "%d/%m/%Y")
+        return dt.strftime("%Y-%m-%d")
+    except ValueError:
+        # Already ISO or unrecognised — return as-is (truncate to 10 chars)
+        return date_part[:10] if len(date_part) >= 10 else date_part
+
+
+def normalize_date_nse(raw: str) -> str:
+    """Normalize an NSE date string to ISO 8601 (YYYY-MM-DD).
+
+    NSE formats observed:
+      - "01-Jan-2024 10:00:00"   (announcements sort_date)
+      - "01-Jan-2024"            (board meetings bm_date)
+      - "2024-01-01T10:00:00"   (ISO already; some endpoints)
+      - "01-01-2024"             (DD-MM-YYYY numeric)
+
+    Args:
+        raw: Raw date string from the NSE API.
+
+    Returns:
+        YYYY-MM-DD string, or the original string if parsing fails.
+    """
+    if not raw:
+        return ""
+    date_part = raw.strip().split(" ")[0]  # Drop time part if present
+
+    # Already ISO: "YYYY-MM-DD" or "YYYY-MM-DDT..."
+    if re.match(r"^\d{4}-\d{2}-\d{2}", date_part):
+        return date_part[:10]
+
+    # "DD-Mon-YYYY"
+    m = re.match(r"^(\d{1,2})-([A-Za-z]{3})-(\d{4})$", date_part)
+    if m:
+        day, mon, year = int(m.group(1)), m.group(2).lower(), int(m.group(3))
+        month = _MONTH_ABBR.get(mon)
+        if month:
+            return f"{year:04d}-{month:02d}-{day:02d}"
+
+    # "DD-MM-YYYY" (numeric)
+    m2 = re.match(r"^(\d{2})-(\d{2})-(\d{4})$", date_part)
+    if m2:
+        day, month, year = int(m2.group(1)), int(m2.group(2)), int(m2.group(3))
+        return f"{year:04d}-{month:02d}-{day:02d}"
+
+    # Fallback
+    return date_part[:10] if len(date_part) >= 10 else date_part
+
+
+def normalize_date_sebi(raw: str) -> str:
+    """Normalize a SEBI date string to ISO 8601 (YYYY-MM-DD).
+
+    SEBI formats observed:
+      - "10-Jan-2024"     (DD-Mon-YYYY — most common)
+      - "Jan 10, 2024"    (Mon DD, YYYY)
+      - "January 10, 2024" (full month name)
+
+    Args:
+        raw: Raw date string from a SEBI HTML response.
+
+    Returns:
+        YYYY-MM-DD string, or the original string if parsing fails.
+    """
+    if not raw:
+        return ""
+    s = raw.strip()
+
+    # "DD-Mon-YYYY" (most common SEBI format)
+    m = re.match(r"^(\d{1,2})-([A-Za-z]{3,9})-(\d{4})$", s)
+    if m:
+        day, mon, year = int(m.group(1)), m.group(2)[:3].lower(), int(m.group(3))
+        month = _MONTH_ABBR.get(mon)
+        if month:
+            return f"{year:04d}-{month:02d}-{day:02d}"
+
+    # "Mon DD, YYYY" or "Month DD, YYYY"
+    m2 = re.match(r"^([A-Za-z]{3,9})\s+(\d{1,2}),\s*(\d{4})$", s)
+    if m2:
+        mon, day, year = m2.group(1)[:3].lower(), int(m2.group(2)), int(m2.group(3))
+        month = _MONTH_ABBR.get(mon)
+        if month:
+            return f"{year:04d}-{month:02d}-{day:02d}"
+
+    # Already ISO
+    if re.match(r"^\d{4}-\d{2}-\d{2}", s):
+        return s[:10]
+
+    return s[:10] if len(s) >= 10 else s
+
 
 # ---------------------------------------------------------------------------
 # BSE configuration (doc URL routing)
@@ -189,21 +309,29 @@ def parse_bse_response(data: dict) -> tuple[list[dict], int]:
         attachment = (row.get("ATTACHMENTNAME") or "").strip()
         doc_url = build_bse_doc_url(row) if attachment else ""
 
+        raw_date = (row.get("NEWS_DT") or "").strip()
         filings.append({
             "source": "bse",
             "filing_id": str(row.get("NEWSID") or ""),
             "company_name": (row.get("SLONGNAME") or "").strip(),
+            "ticker": str(row.get("SCRIP_CD") or "").strip(),
+            # Keep legacy 'symbol' key for callers that still read it
             "symbol": str(row.get("SCRIP_CD") or "").strip(),
             "isin": "",
             "category": (row.get("CATEGORYNAME") or "").strip(),
             "subcategory": (row.get("SUBCATNAME") or "").strip(),
             "subject": (row.get("NEWSSUB") or "").strip(),
+            "headline": (row.get("NEWSSUB") or row.get("HEADLINE") or "").strip(),
             "description": (row.get("HEADLINE") or "").strip(),
-            "filing_date": (row.get("NEWS_DT") or "").strip(),
+            "filing_date": normalize_date_bse(raw_date),
+            "filing_time": raw_date[11:19] if len(raw_date) > 10 else "",
             "document_url": doc_url,
+            "direct_download_url": doc_url,
             "file_size": str(row.get("Fld_Attachsize") or ""),
             "has_xbrl": False,
             "raw_json": json.dumps(row, ensure_ascii=False),
+            "raw_metadata": json.dumps(row, ensure_ascii=False),
+            "country": "IN",
         })
 
     return filings, total
@@ -231,85 +359,117 @@ def _normalize_nse_record(row: dict, endpoint_type: str) -> Optional[dict]:
 
     if endpoint_type == "announcements":
         att_file = (row.get("attchmntFile") or "").strip()
+        raw_date = (row.get("sort_date") or "").strip()
+        headline = (row.get("attchmntText") or "").strip()
         return {
             "source": "nse",
             "filing_id": str(row.get("seq_id") or ""),
             "company_name": company,
+            "ticker": symbol,
             "symbol": symbol,
             "isin": isin,
             "category": (row.get("desc") or "").strip(),
             "subcategory": row.get("smIndustry") or "",
-            "subject": (row.get("attchmntText") or "").strip(),
-            "description": (row.get("attchmntText") or "").strip(),
-            "filing_date": (row.get("sort_date") or "").strip(),
+            "subject": headline,
+            "headline": headline,
+            "description": headline,
+            "filing_date": normalize_date_nse(raw_date),
+            "filing_time": raw_date[12:20] if len(raw_date) > 11 else "",
             "document_url": att_file if att_file and att_file != "-" else "",
+            "direct_download_url": att_file if att_file and att_file != "-" else "",
             "file_size": str(row.get("fileSize") or ""),
             "has_xbrl": bool(row.get("hasXbrl")),
             "raw_json": json.dumps(row, ensure_ascii=False),
+            "raw_metadata": json.dumps(row, ensure_ascii=False),
+            "country": "IN",
         }
 
     if endpoint_type == "annual_reports":
         doc_url = (row.get("fileName") or "").strip()
         from_yr = row.get("fromYr") or ""
         to_yr = row.get("toYr") or ""
+        raw_date = (row.get("broadcast_dttm") or "").strip()
+        headline = f"Annual Report {from_yr}-{to_yr} - {company}"
         return {
             "source": "nse",
             "filing_id": f"ar_{symbol}_{from_yr}_{to_yr}",
             "company_name": company,
+            "ticker": symbol,
             "symbol": symbol,
             "isin": isin,
             "category": "Annual Report",
             "subcategory": f"{from_yr}-{to_yr}",
-            "subject": f"Annual Report {from_yr}-{to_yr} - {company}",
+            "subject": headline,
+            "headline": headline,
             "description": "",
-            "filing_date": (row.get("broadcast_dttm") or "").strip(),
+            "filing_date": normalize_date_nse(raw_date),
+            "filing_time": raw_date[12:20] if len(raw_date) > 11 else "",
             "document_url": doc_url if doc_url and doc_url != "-" else "",
+            "direct_download_url": doc_url if doc_url and doc_url != "-" else "",
             "file_size": str(row.get("attFileSize") or ""),
             "has_xbrl": False,
             "raw_json": json.dumps(row, ensure_ascii=False),
+            "raw_metadata": json.dumps(row, ensure_ascii=False),
+            "country": "IN",
         }
 
     if endpoint_type == "board_meetings":
         # NSE has documented typo "sm_indusrty" (not "sm_industry") in some responses
         att_file = (row.get("attachment") or "").strip()
         bm_symbol = (row.get("bm_symbol") or symbol).strip()
+        raw_date = (row.get("bm_timestamp") or row.get("bm_date") or "").strip()
+        headline = (row.get("bm_purpose") or "").strip()
         return {
             "source": "nse",
             "filing_id": f"bm_{bm_symbol}_{row.get('bm_timestamp', '')}",
             "company_name": (row.get("sm_name") or company).strip(),
+            "ticker": bm_symbol,
             "symbol": bm_symbol,
             "isin": (row.get("sm_isin") or isin).strip(),
             "category": "Board Meeting",
-            "subcategory": (row.get("bm_purpose") or "").strip(),
-            "subject": (row.get("bm_purpose") or "").strip(),
+            "subcategory": headline,
+            "subject": headline,
+            "headline": headline,
             "description": (row.get("bm_desc") or "").strip(),
-            "filing_date": (row.get("bm_timestamp") or row.get("bm_date") or "").strip(),
+            "filing_date": normalize_date_nse(raw_date),
+            "filing_time": raw_date[12:20] if len(raw_date) > 11 else "",
             "document_url": att_file if att_file and att_file != "-" else "",
+            "direct_download_url": att_file if att_file and att_file != "-" else "",
             "file_size": str(row.get("attFileSize") or ""),
             "has_xbrl": bool(att_file),
             "raw_json": json.dumps(row, ensure_ascii=False),
+            "raw_metadata": json.dumps(row, ensure_ascii=False),
+            "country": "IN",
         }
 
     if endpoint_type == "financial_results":
         xbrl_url = (row.get("xbrl") or "").strip()
         doc_url = xbrl_url if xbrl_url and not xbrl_url.endswith("/-") else ""
+        raw_date = (row.get("filingDate") or row.get("broadCastDate") or "").strip()
+        headline = (
+            f"{row.get('relatingTo', '')} Results - {company} ({row.get('audited', '')})"
+        )
         return {
             "source": "nse",
             "filing_id": f"fr_{row.get('seqNumber', '')}",
             "company_name": company,
+            "ticker": symbol,
             "symbol": symbol,
             "isin": (row.get("isin") or isin).strip(),
             "category": "Financial Results",
             "subcategory": (row.get("relatingTo") or "").strip(),
-            "subject": (
-                f"{row.get('relatingTo', '')} Results - {company} ({row.get('audited', '')})"
-            ),
+            "subject": headline,
+            "headline": headline,
             "description": (row.get("resultDescription") or "").strip(),
-            "filing_date": (row.get("filingDate") or row.get("broadCastDate") or "").strip(),
+            "filing_date": normalize_date_nse(raw_date),
+            "filing_time": raw_date[12:20] if len(raw_date) > 11 else "",
             "document_url": doc_url,
+            "direct_download_url": doc_url,
             "file_size": "",
             "has_xbrl": bool(doc_url),
             "raw_json": json.dumps(row, ensure_ascii=False),
+            "raw_metadata": json.dumps(row, ensure_ascii=False),
+            "country": "IN",
         }
 
     return None
@@ -465,21 +625,28 @@ def _parse_sebi_html(html: str, category_id: int) -> list[dict]:
             fid_match.group(1) if fid_match else main_url.split("?")[0].rstrip("/")
         )
 
+        iso_date = normalize_date_sebi(date_text)
         filings.append({
             "source": "sebi",
             "filing_id": filing_id,
             "company_name": title,
+            "ticker": "",
             "symbol": "",
             "isin": "",
             "category": category_name,
             "subcategory": "",
             "subject": title,
+            "headline": title,
             "description": "",
-            "filing_date": date_text,
+            "filing_date": iso_date,
+            "filing_time": "",
             "document_url": main_url,
+            "direct_download_url": main_url,
             "file_size": "",
             "has_xbrl": False,
             "raw_json": "",
+            "raw_metadata": "",
+            "country": "IN",
         })
 
         # Additional links are companion documents (direct PDFs)
@@ -505,17 +672,23 @@ def _parse_sebi_html(html: str, category_id: int) -> list[dict]:
                 "source": "sebi",
                 "filing_id": extra_id,
                 "company_name": title,
+                "ticker": "",
                 "symbol": "",
                 "isin": "",
                 "category": category_name,
                 "subcategory": "companion",
                 "subject": extra_title or f"{title} - Companion",
+                "headline": extra_title or f"{title} - Companion",
                 "description": "",
-                "filing_date": date_text,
+                "filing_date": iso_date,
+                "filing_time": "",
                 "document_url": extra_url,
+                "direct_download_url": extra_url,
                 "file_size": "",
                 "has_xbrl": False,
                 "raw_json": "",
+                "raw_metadata": "",
+                "country": "IN",
             })
 
     return filings

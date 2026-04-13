@@ -6,6 +6,9 @@ These tests mock the network layer and verify that:
   - --incremental stops on first no-new page
   - --resume picks up from saved crawl state
   - cmd_stats and cmd_export work end-to-end
+  - stats --json outputs valid JSON with all required fields
+  - health detection logic is correct
+  - exit codes are correct
 """
 
 from __future__ import annotations
@@ -15,6 +18,7 @@ import os
 import sys
 import argparse
 import tempfile
+from datetime import datetime, timedelta
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -24,6 +28,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 from db import FilingCache
 import scraper
 from parsers import parse_bse_response, parse_nse_response, parse_sebi_page
+from scraper import EXIT_OK, EXIT_ERROR, EXIT_PARTIAL, EXIT_FATAL, _compute_health
 
 
 # ---------------------------------------------------------------------------
@@ -49,6 +54,7 @@ def make_args(**kwargs) -> argparse.Namespace:
         "log_file": "",
         "output": "/tmp/test_export.json",
         "interval": 1,
+        "json": False,  # stats --json flag
     }
     defaults.update(kwargs)
     return argparse.Namespace(**defaults)
@@ -59,17 +65,23 @@ BSE_PAGE_FILINGS = [
         "source": "bse",
         "filing_id": f"BSE_{i}",
         "company_name": f"Company {i}",
+        "ticker": f"SYM{i}",
         "symbol": f"SYM{i}",
         "isin": "",
         "category": "Board Meeting",
         "subcategory": "",
+        "headline": "Board Meeting Notice",
         "subject": "Board Meeting Notice",
         "description": "",
-        "filing_date": "01/01/2024 10:00:00",
+        "filing_date": "2024-01-01",  # ISO date
+        "filing_time": "10:00:00",
         "document_url": "",
+        "direct_download_url": "",
         "file_size": "",
         "has_xbrl": False,
         "raw_json": "{}",
+        "raw_metadata": "{}",
+        "country": "IN",
     }
     for i in range(5)
 ]
@@ -330,3 +342,166 @@ class TestResumeCrawl:
 
         # First page fetched should be 4 (last_page=3, so resume from 4)
         assert pages_fetched[0] == 4
+
+
+# ===========================================================================
+# stats --json
+# ===========================================================================
+
+
+class TestCmdStatsJson:
+    """Tests for cmd_stats with --json flag."""
+
+    def test_json_output_is_valid_json(self, tmp_db, capsys):
+        """--json outputs valid JSON."""
+        with patch("scraper.FilingCache", return_value=tmp_db):
+            args = make_args(source="all", **{"json": True, "doc_dir": "/tmp/docs"})
+            scraper.cmd_stats(args)
+        captured = capsys.readouterr()
+        data = json.loads(captured.out)
+        assert isinstance(data, dict)
+
+    def test_json_output_required_fields(self, tmp_db, capsys):
+        """--json output contains all required fields."""
+        with patch("scraper.FilingCache", return_value=tmp_db):
+            args = make_args(source="all", **{"json": True, "doc_dir": "/tmp/docs"})
+            scraper.cmd_stats(args)
+        captured = capsys.readouterr()
+        data = json.loads(captured.out)
+        required = {
+            "scraper", "country", "sources", "total_filings", "downloaded",
+            "pending_download", "unique_companies", "total_crawl_runs",
+            "earliest_record", "latest_record", "db_size_bytes",
+            "documents_size_bytes", "health",
+        }
+        missing = required - data.keys()
+        assert not missing, f"Missing JSON keys: {missing}"
+
+    def test_json_scraper_and_country(self, tmp_db, capsys):
+        """scraper=india-scraper and country=IN are correct."""
+        with patch("scraper.FilingCache", return_value=tmp_db):
+            args = make_args(source="all", **{"json": True, "doc_dir": "/tmp/docs"})
+            scraper.cmd_stats(args)
+        captured = capsys.readouterr()
+        data = json.loads(captured.out)
+        assert data["scraper"] == "india-scraper"
+        assert data["country"] == "IN"
+        assert data["sources"] == ["bse", "nse", "sebi"]
+
+    def test_json_health_empty_when_no_filings(self, tmp_db, capsys):
+        """health='empty' when DB has no filings."""
+        with patch("scraper.FilingCache", return_value=tmp_db):
+            args = make_args(source="all", **{"json": True, "doc_dir": "/tmp/docs"})
+            scraper.cmd_stats(args)
+        captured = capsys.readouterr()
+        data = json.loads(captured.out)
+        assert data["health"] == "empty"
+
+    def test_json_counts_match_db(self, tmp_db, capsys, sample_bse_filing, sample_nse_filing):
+        """total_filings, downloaded, pending_download match actual DB state."""
+        tmp_db.insert_batch([sample_bse_filing, sample_nse_filing])
+        tmp_db.mark_downloaded("bse", sample_bse_filing["filing_id"], "/tmp/test.pdf")
+
+        with patch("scraper.FilingCache", return_value=tmp_db):
+            args = make_args(source="all", **{"json": True, "doc_dir": "/tmp/docs"})
+            scraper.cmd_stats(args)
+        captured = capsys.readouterr()
+        data = json.loads(captured.out)
+        assert data["total_filings"] == 2
+        assert data["downloaded"] == 1
+        assert data["pending_download"] == 1
+
+    def test_json_unique_companies(self, tmp_db, capsys, sample_bse_filing, sample_nse_filing):
+        """unique_companies field is populated correctly."""
+        tmp_db.insert_batch([sample_bse_filing, sample_nse_filing])
+        with patch("scraper.FilingCache", return_value=tmp_db):
+            args = make_args(source="all", **{"json": True, "doc_dir": "/tmp/docs"})
+            scraper.cmd_stats(args)
+        captured = capsys.readouterr()
+        data = json.loads(captured.out)
+        # sample_bse_filing = "Test Corp", sample_nse_filing = "NSE Test Corp"
+        assert data["unique_companies"] == 2
+
+    def test_json_exit_code_ok(self, tmp_db):
+        """cmd_stats --json returns EXIT_OK on success."""
+        with patch("scraper.FilingCache", return_value=tmp_db):
+            args = make_args(source="all", **{"json": True, "doc_dir": "/tmp/docs"})
+            code = scraper.cmd_stats(args)
+        assert code == EXIT_OK
+
+
+# ===========================================================================
+# Health detection
+# ===========================================================================
+
+
+class TestComputeHealth:
+    """Tests for _compute_health() health status logic."""
+
+    def test_empty_when_no_filings(self):
+        """Returns 'empty' when total=0."""
+        assert _compute_health(0, None) == "empty"
+        assert _compute_health(0, "2024-01-01") == "empty"
+
+    def test_ok_when_recent(self):
+        """Returns 'ok' when newest date is within 3 days."""
+        today = datetime.now().strftime("%Y-%m-%d")
+        assert _compute_health(10, today) == "ok"
+
+    def test_stale_when_3_to_30_days_old(self):
+        """Returns 'stale' when newest date is 4-30 days old."""
+        stale_date = (datetime.now() - timedelta(days=10)).strftime("%Y-%m-%d")
+        assert _compute_health(10, stale_date) == "stale"
+
+    def test_degraded_when_over_30_days_old(self):
+        """Returns 'degraded' when newest date is >30 days old."""
+        old_date = (datetime.now() - timedelta(days=60)).strftime("%Y-%m-%d")
+        assert _compute_health(10, old_date) == "degraded"
+
+    def test_error_when_date_missing(self):
+        """Returns 'error' when total > 0 but newest is None/empty."""
+        assert _compute_health(5, None) == "error"
+        assert _compute_health(5, "") == "error"
+
+    def test_error_when_date_unparseable(self):
+        """Returns 'error' when newest date is not a valid date string."""
+        assert _compute_health(5, "not-a-date") == "error"
+
+    def test_ok_uses_today_correctly(self):
+        """A filing from today has health='ok'."""
+        today = datetime.now().strftime("%Y-%m-%d")
+        assert _compute_health(1, today) == "ok"
+
+
+# ===========================================================================
+# Exit codes
+# ===========================================================================
+
+
+class TestExitCodes:
+    """Tests for standard exit codes (0/1/2/3)."""
+
+    def test_exit_constants_defined(self):
+        """EXIT_OK=0, EXIT_ERROR=1, EXIT_PARTIAL=2, EXIT_FATAL=3 are defined."""
+        assert EXIT_OK == 0
+        assert EXIT_ERROR == 1
+        assert EXIT_PARTIAL == 2
+        assert EXIT_FATAL == 3
+
+    def test_cmd_stats_returns_exit_ok(self, tmp_db):
+        """cmd_stats returns EXIT_OK when successful."""
+        with patch("scraper.FilingCache", return_value=tmp_db):
+            args = make_args(source="all")
+            # Ensure the 'json' attribute is False (not set)
+            args.json = False
+            code = scraper.cmd_stats(args)
+        assert code == EXIT_OK
+
+    def test_cmd_export_returns_exit_ok(self, tmp_db, tmp_path, sample_bse_filing):
+        """cmd_export returns EXIT_OK when export succeeds."""
+        tmp_db.insert_batch([sample_bse_filing])
+        out_path = str(tmp_path / "out.json")
+        with patch("scraper.FilingCache", return_value=tmp_db):
+            args = make_args(output=out_path, source="all")
+            code = scraper.cmd_export(args)
+        assert code == EXIT_OK

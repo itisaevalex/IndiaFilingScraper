@@ -25,8 +25,10 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import json
 import logging
 import os
+import sys
 import time
 from datetime import datetime, timedelta
 
@@ -42,6 +44,15 @@ from parsers import (
     parse_nse_response,
     parse_sebi_page,
 )
+
+# ---------------------------------------------------------------------------
+# Exit codes
+# ---------------------------------------------------------------------------
+
+EXIT_OK = 0       # Success
+EXIT_ERROR = 1    # General error (fetch failed, parse error, etc.)
+EXIT_PARTIAL = 2  # Partial success (some sources failed)
+EXIT_FATAL = 3    # Fatal error (DB inaccessible, bad config, etc.)
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -682,14 +693,28 @@ def _crawl_sebi_category(
 # ---------------------------------------------------------------------------
 
 
-def cmd_crawl(args: argparse.Namespace) -> None:
+def cmd_crawl(args: argparse.Namespace) -> int:
     """Execute the crawl command.
 
     Args:
         args: Parsed CLI arguments.
+
+    Returns:
+        Exit code (EXIT_OK / EXIT_ERROR / EXIT_PARTIAL / EXIT_FATAL).
     """
-    session = create_session()
-    cache = FilingCache(args.db)
+    try:
+        session = create_session()
+    except Exception as exc:  # pragma: no cover
+        log.error("Failed to create HTTP session: %s", exc)
+        return EXIT_FATAL
+
+    try:
+        cache = FilingCache(args.db)
+    except Exception as exc:
+        log.error("Failed to open DB %r: %s", args.db, exc)
+        return EXIT_FATAL
+
+    source_errors: list[str] = []
     try:
         doc_dir = args.doc_dir
         t_start = time.time()
@@ -704,47 +729,53 @@ def cmd_crawl(args: argparse.Namespace) -> None:
         for source in sources:
             log.info("=== Crawling %s ===", source.upper())
 
-            if source == "bse":
-                total_f, new_f, dl_f = _crawl_bse(
-                    session,
-                    cache,
-                    doc_dir,
-                    args.max_pages,
-                    args.download,
-                    args.parallel,
-                    from_date=args.from_date,
-                    to_date=args.to_date,
-                    incremental=args.incremental,
-                    resume=args.resume,
-                )
-            elif source == "nse":
-                total_f, new_f, dl_f = _crawl_nse(
-                    session,
-                    cache,
-                    doc_dir,
-                    args.max_pages,
-                    args.download,
-                    args.parallel,
-                    nse_types=args.nse_type,
-                    from_date=args.from_date,
-                    to_date=args.to_date,
-                    incremental=args.incremental,
-                    resume=args.resume,
-                )
-            elif source == "sebi":
-                total_f, new_f, dl_f = _crawl_sebi(
-                    session,
-                    cache,
-                    doc_dir,
-                    args.max_pages,
-                    args.download,
-                    args.parallel,
-                    categories=args.sebi_category,
-                    incremental=args.incremental,
-                    resume=args.resume,
-                )
-            else:
-                log.error("Unknown source: %s", source)
+            try:
+                if source == "bse":
+                    total_f, new_f, dl_f = _crawl_bse(
+                        session,
+                        cache,
+                        doc_dir,
+                        args.max_pages,
+                        args.download,
+                        args.parallel,
+                        from_date=args.from_date,
+                        to_date=args.to_date,
+                        incremental=args.incremental,
+                        resume=args.resume,
+                    )
+                elif source == "nse":
+                    total_f, new_f, dl_f = _crawl_nse(
+                        session,
+                        cache,
+                        doc_dir,
+                        args.max_pages,
+                        args.download,
+                        args.parallel,
+                        nse_types=args.nse_type,
+                        from_date=args.from_date,
+                        to_date=args.to_date,
+                        incremental=args.incremental,
+                        resume=args.resume,
+                    )
+                elif source == "sebi":
+                    total_f, new_f, dl_f = _crawl_sebi(
+                        session,
+                        cache,
+                        doc_dir,
+                        args.max_pages,
+                        args.download,
+                        args.parallel,
+                        categories=args.sebi_category,
+                        incremental=args.incremental,
+                        resume=args.resume,
+                    )
+                else:
+                    log.error("Unknown source: %s", source)
+                    source_errors.append(source)
+                    continue
+            except Exception as exc:
+                log.error("Source %s failed: %s", source, exc)
+                source_errors.append(source)
                 continue
 
             total_filings += total_f
@@ -762,14 +793,29 @@ def cmd_crawl(args: argparse.Namespace) -> None:
     finally:
         cache.close()
 
+    if source_errors and len(source_errors) == len(
+        ["bse", "nse", "sebi"] if args.source == "all" else [args.source]
+    ):
+        return EXIT_ERROR  # All sources failed
+    if source_errors:
+        return EXIT_PARTIAL  # Some sources failed
+    return EXIT_OK
 
-def cmd_monitor(args: argparse.Namespace) -> None:
+
+def cmd_monitor(args: argparse.Namespace) -> int:
     """Execute the monitor command.
 
     Args:
         args: Parsed CLI arguments.
+
+    Returns:
+        EXIT_OK when stopped, EXIT_FATAL if DB cannot be opened.
     """
-    cache = FilingCache(args.db)
+    try:
+        cache = FilingCache(args.db)
+    except Exception as exc:
+        log.error("Failed to open DB %r: %s", args.db, exc)
+        return EXIT_FATAL
     known_keys = cache.get_known_keys(args.source if args.source != "all" else "")
     session = create_session()
 
@@ -843,32 +889,147 @@ def cmd_monitor(args: argparse.Namespace) -> None:
         log.info("Monitor stopped. %d polls, %d filings known.", polls, len(known_keys))
     finally:
         cache.close()
+    return EXIT_OK
 
 
-def cmd_export(args: argparse.Namespace) -> None:
+def cmd_export(args: argparse.Namespace) -> int:
     """Execute the export command.
 
     Args:
         args: Parsed CLI arguments.
+
+    Returns:
+        EXIT_OK on success, EXIT_FATAL / EXIT_ERROR on failure.
     """
-    cache = FilingCache(args.db)
+    try:
+        cache = FilingCache(args.db)
+    except Exception as exc:
+        log.error("Failed to open DB %r: %s", args.db, exc)
+        return EXIT_FATAL
+
     try:
         cache.export_json(
             args.output, source=args.source if args.source != "all" else ""
         )
         log.info("Exported to %s", args.output)
+        return EXIT_OK
+    except OSError as exc:
+        log.error("Failed to write export file %r: %s", args.output, exc)
+        return EXIT_ERROR
     finally:
         cache.close()
 
 
-def cmd_stats(args: argparse.Namespace) -> None:
+def _compute_health(
+    total: int,
+    newest: str | None,
+) -> str:
+    """Compute a health status string based on filing counts and recency.
+
+    Health levels:
+      - "empty":    no filings at all
+      - "ok":       filings present and latest record is within 3 days
+      - "stale":    filings present but latest record is older than 3 days
+      - "degraded": filings present but latest record is older than 30 days
+      - "error":    cannot determine (missing date)
+
+    Args:
+        total: Total number of filings in the DB.
+        newest: ISO date string (YYYY-MM-DD) of the most recent filing, or None.
+
+    Returns:
+        Health status string.
+    """
+    if total == 0:
+        return "empty"
+    if not newest:
+        return "error"
+
+    try:
+        newest_dt = datetime.strptime(newest[:10], "%Y-%m-%d")
+        age_days = (datetime.now() - newest_dt).days
+        if age_days <= 3:
+            return "ok"
+        if age_days <= 30:
+            return "stale"
+        return "degraded"
+    except ValueError:
+        return "error"
+
+
+def _documents_dir_size(doc_dir: str) -> int:
+    """Return total bytes in the documents directory (0 if not present)."""
+    if not os.path.isdir(doc_dir):
+        return 0
+    total = 0
+    for dirpath, _dirnames, filenames in os.walk(doc_dir):
+        for fname in filenames:
+            try:
+                total += os.path.getsize(os.path.join(dirpath, fname))
+            except OSError:
+                pass
+    return total
+
+
+def cmd_stats(args: argparse.Namespace) -> int:
     """Execute the stats command.
 
     Args:
         args: Parsed CLI arguments.
+
+    Returns:
+        EXIT_OK on success, EXIT_FATAL if DB cannot be opened.
     """
-    cache = FilingCache(args.db)
     try:
+        cache = FilingCache(args.db)
+    except Exception as exc:
+        log.error("Failed to open DB %r: %s", args.db, exc)
+        if getattr(args, "json", False):
+            print(json.dumps({"error": str(exc), "health": "error"}, indent=2))
+        return EXIT_FATAL
+
+    try:
+        if getattr(args, "json", False):
+            # --- JSON output ---
+            s = cache.stats()
+            total = int(s["total"] or 0)
+            downloaded = int(s["downloaded"] or 0)
+            pending = int(s["pending"] or 0)
+            newest = s.get("newest") or None
+            oldest = s.get("oldest") or None
+
+            db_size = 0
+            try:
+                db_size = os.path.getsize(args.db)
+            except OSError:
+                pass
+
+            doc_dir = getattr(args, "doc_dir", "documents")
+            docs_size = _documents_dir_size(doc_dir)
+
+            unique_companies = cache.unique_companies()
+            crawl_runs = cache.total_crawl_runs()
+            health = _compute_health(total, newest)
+
+            output = {
+                "scraper": "india-scraper",
+                "country": "IN",
+                "sources": ["bse", "nse", "sebi"],
+                "total_filings": total,
+                "downloaded": downloaded,
+                "pending_download": pending,
+                "unique_companies": unique_companies,
+                "total_crawl_runs": crawl_runs,
+                "earliest_record": oldest,
+                "latest_record": newest,
+                "db_size_bytes": db_size,
+                "documents_size_bytes": docs_size,
+                "health": health,
+            }
+            print(json.dumps(output, indent=2))
+            return EXIT_OK
+
+        # --- Human-readable output ---
         sources = ["bse", "nse", "sebi"] if args.source == "all" else [args.source]
 
         for source in sources:
@@ -886,6 +1047,8 @@ def cmd_stats(args: argparse.Namespace) -> None:
             print(f"  Total:      {s['total'] or 0}")
             print(f"  Downloaded: {s['downloaded'] or 0}")
             print(f"  Pending:    {s['pending'] or 0}")
+
+        return EXIT_OK
     finally:
         cache.close()
 
@@ -987,6 +1150,16 @@ def main() -> None:
     st = sub.add_parser("stats", help="Show cache statistics")
     st.add_argument("--source", choices=["bse", "nse", "sebi", "all"], default="all")
     st.add_argument("--db", default=DB_FILE)
+    st.add_argument(
+        "--json",
+        action="store_true",
+        help="Output statistics as a JSON object (machine-readable)",
+    )
+    st.add_argument(
+        "--doc-dir",
+        default="documents",
+        help="Documents directory (used for disk size in --json mode)",
+    )
     st.add_argument("--log-file", default="", help="Optional log file path")
 
     args = p.parse_args()
@@ -1003,9 +1176,11 @@ def main() -> None:
     }
 
     if args.command in cmds:
-        cmds[args.command](args)
+        exit_code = cmds[args.command](args)
+        sys.exit(exit_code if isinstance(exit_code, int) else EXIT_OK)
     else:
         p.print_help()
+        sys.exit(EXIT_OK)
 
 
 if __name__ == "__main__":

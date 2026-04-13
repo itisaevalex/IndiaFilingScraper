@@ -98,62 +98,80 @@ def tmp_db():
 
 @pytest.fixture
 def sample_bse_filing() -> dict:
-    """A minimal valid BSE filing dict."""
+    """A minimal valid BSE filing dict (L3 spec — ISO date)."""
     return {
         "source": "bse",
         "filing_id": "TEST_BSE_001",
         "company_name": "Test Corp",
+        "ticker": "TESTCORP",
         "symbol": "TESTCORP",
         "isin": "",
         "category": "Board Meeting",
         "subcategory": "",
+        "headline": "Board Meeting Notice",
         "subject": "Board Meeting Notice",
         "description": "Notice of Board Meeting",
-        "filing_date": "01/01/2024 10:00:00",
+        "filing_date": "2024-01-01",          # ISO date (already normalized)
+        "filing_time": "10:00:00",
         "document_url": "https://www.bseindia.com/xml-data/corpfiling/AttachLive/test.pdf",
+        "direct_download_url": "https://www.bseindia.com/xml-data/corpfiling/AttachLive/test.pdf",
         "file_size": "12345",
         "has_xbrl": False,
         "raw_json": "{}",
+        "raw_metadata": "{}",
+        "country": "IN",
     }
 
 
 @pytest.fixture
 def sample_nse_filing() -> dict:
-    """A minimal valid NSE filing dict."""
+    """A minimal valid NSE filing dict (L3 spec — ISO date)."""
     return {
         "source": "nse",
         "filing_id": "TEST_NSE_001",
         "company_name": "NSE Test Corp",
+        "ticker": "NSETEST",
         "symbol": "NSETEST",
         "isin": "INE123456789",
         "category": "Financial Results",
         "subcategory": "IT",
+        "headline": "Q3 Financial Results",
         "subject": "Q3 Financial Results",
         "description": "Q3 Financial Results",
-        "filing_date": "2024-01-01T10:00:00",
+        "filing_date": "2024-01-01",          # ISO date (already normalized)
+        "filing_time": "10:00:00",
         "document_url": "https://nsearchives.nseindia.com/corporate/xbrl/test.pdf",
+        "direct_download_url": "https://nsearchives.nseindia.com/corporate/xbrl/test.pdf",
         "file_size": "98765",
         "has_xbrl": True,
         "raw_json": "{}",
+        "raw_metadata": "{}",
+        "country": "IN",
     }
 
 
 @pytest.fixture
 def sample_sebi_filing() -> dict:
-    """A minimal valid SEBI filing dict."""
+    """A minimal valid SEBI filing dict (L3 spec — ISO date)."""
     return {
         "source": "sebi",
         "filing_id": "12345",
         "company_name": "SEBI Test Corp IPO",
+        "ticker": "",
         "symbol": "",
         "isin": "",
         "category": "Public Issues",
         "subcategory": "",
+        "headline": "Draft Red Herring Prospectus",
         "subject": "Draft Red Herring Prospectus",
         "description": "",
-        "filing_date": "10-Jan-2024",
+        "filing_date": "2024-01-10",          # ISO date (already normalized)
+        "filing_time": "",
         "document_url": "https://www.sebi.gov.in/sebi_data/commondocs/filings/PublicIssues_12345.html",
+        "direct_download_url": "https://www.sebi.gov.in/sebi_data/commondocs/filings/PublicIssues_12345.html",
         "file_size": "",
         "has_xbrl": False,
         "raw_json": "",
+        "raw_metadata": "",
+        "country": "IN",
     }

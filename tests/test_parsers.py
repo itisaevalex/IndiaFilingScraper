@@ -2,6 +2,7 @@
 test_parsers.py — Unit tests for all 3 source parsers and type classification.
 
 Tests:
+  - Date normalization for BSE, NSE, SEBI (L3 requirement)
   - BSE JSON response parsing + PDFFLAG URL routing
   - NSE JSON response parsing (all 4 endpoint types)
   - SEBI HTML/#@# response parsing
@@ -22,6 +23,9 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 from parsers import (
     build_bse_doc_url,
     classify_filing_type,
+    normalize_date_bse,
+    normalize_date_nse,
+    normalize_date_sebi,
     parse_bse_response,
     parse_nse_response,
     parse_sebi_page,
@@ -29,6 +33,108 @@ from parsers import (
     SEBI_CATEGORY_NAMES,
     SEBI_DOC_BASE,
 )
+
+
+# ===========================================================================
+# Date normalization tests (L3 requirement)
+# ===========================================================================
+
+
+class TestNormalizeDateBse:
+    """Tests for normalize_date_bse() — converts BSE DD/MM/YYYY to YYYY-MM-DD."""
+
+    @pytest.mark.parametrize("raw, expected", [
+        ("01/01/2024 10:00:00", "2024-01-01"),
+        ("15/03/2024 09:30:00", "2024-03-15"),
+        ("31/12/2023 23:59:59", "2023-12-31"),
+        ("01/01/2024",          "2024-01-01"),   # no time component
+        ("2024-01-15",          "2024-01-15"),   # already ISO — pass through
+        ("",                    ""),             # empty input
+    ])
+    def test_bse_date_normalization(self, raw, expected):
+        """BSE date strings are correctly normalized to YYYY-MM-DD."""
+        assert normalize_date_bse(raw) == expected
+
+    def test_bse_date_in_parsed_filings(self, bse_response_data):
+        """All filing_date values in BSE response are YYYY-MM-DD."""
+        import re
+        filings, _ = parse_bse_response(bse_response_data)
+        for f in filings:
+            date = f["filing_date"]
+            if date:
+                assert re.match(r"^\d{4}-\d{2}-\d{2}$", date), (
+                    f"BSE filing_date not ISO: {date!r}"
+                )
+
+
+class TestNormalizeDateNse:
+    """Tests for normalize_date_nse() — handles multiple NSE date formats."""
+
+    @pytest.mark.parametrize("raw, expected", [
+        ("01-Jan-2024 10:00:00", "2024-01-01"),
+        ("15-Mar-2024 09:30:00", "2024-03-15"),
+        ("31-Dec-2023",          "2023-12-31"),
+        ("01-jan-2024",          "2024-01-01"),   # lowercase month
+        ("2024-01-15T10:00:00",  "2024-01-15"),   # already ISO datetime
+        ("2024-01-15",           "2024-01-15"),   # already ISO date
+        ("01-01-2024",           "2024-01-01"),   # DD-MM-YYYY numeric
+        ("",                     ""),             # empty input
+    ])
+    def test_nse_date_normalization(self, raw, expected):
+        """NSE date strings are correctly normalized to YYYY-MM-DD."""
+        assert normalize_date_nse(raw) == expected
+
+    def test_nse_announcements_dates_are_iso(self, nse_announcements_data):
+        """All filing_date values in NSE announcements response are YYYY-MM-DD."""
+        import re
+        filings = parse_nse_response(nse_announcements_data, "announcements")
+        for f in filings:
+            date = f["filing_date"]
+            if date:
+                assert re.match(r"^\d{4}-\d{2}-\d{2}$", date), (
+                    f"NSE announcement filing_date not ISO: {date!r}"
+                )
+
+    def test_nse_board_meetings_dates_are_iso(self, nse_board_meetings_data):
+        """All filing_date values in NSE board_meetings response are YYYY-MM-DD."""
+        import re
+        filings = parse_nse_response(nse_board_meetings_data, "board_meetings")
+        for f in filings:
+            date = f["filing_date"]
+            if date:
+                assert re.match(r"^\d{4}-\d{2}-\d{2}$", date), (
+                    f"NSE board meeting filing_date not ISO: {date!r}"
+                )
+
+
+class TestNormalizeDateSebi:
+    """Tests for normalize_date_sebi() — handles DD-Mon-YYYY and Mon DD, YYYY."""
+
+    @pytest.mark.parametrize("raw, expected", [
+        ("10-Jan-2024",   "2024-01-10"),
+        ("01-jan-2024",   "2024-01-01"),   # lowercase
+        ("15-Mar-2024",   "2024-03-15"),
+        ("31-Dec-2023",   "2023-12-31"),
+        ("Jan 10, 2024",  "2024-01-10"),   # Mon DD, YYYY
+        ("Mar 15, 2024",  "2024-03-15"),
+        ("January 10, 2024", "2024-01-10"),  # full month name
+        ("2024-01-10",    "2024-01-10"),   # already ISO
+        ("",              ""),             # empty input
+    ])
+    def test_sebi_date_normalization(self, raw, expected):
+        """SEBI date strings are correctly normalized to YYYY-MM-DD."""
+        assert normalize_date_sebi(raw) == expected
+
+    def test_sebi_page_dates_are_iso(self, sebi_response_text):
+        """All filing_date values in SEBI response are YYYY-MM-DD."""
+        import re
+        filings, _ = parse_sebi_page(sebi_response_text, category_id=15, current_page=0)
+        for f in filings:
+            date = f["filing_date"]
+            if date:
+                assert re.match(r"^\d{4}-\d{2}-\d{2}$", date), (
+                    f"SEBI filing_date not ISO: {date!r}"
+                )
 
 
 # ===========================================================================
@@ -109,12 +215,13 @@ class TestParseBseResponse:
         assert total == 1250
 
     def test_filing_schema_completeness(self, bse_response_data):
-        """Every parsed filing has all required schema fields."""
+        """Every parsed filing has all required schema fields (L3 spec)."""
         filings, _ = parse_bse_response(bse_response_data)
         required = {
-            "source", "filing_id", "company_name", "symbol", "isin",
-            "category", "subcategory", "subject", "description",
-            "filing_date", "document_url", "file_size", "has_xbrl", "raw_json",
+            "source", "filing_id", "company_name", "ticker", "symbol",
+            "category", "subject", "headline", "filing_date", "filing_time",
+            "document_url", "direct_download_url", "file_size", "raw_metadata",
+            "country",
         }
         for f in filings:
             assert required.issubset(f.keys()), f"Missing keys: {required - f.keys()}"
@@ -358,13 +465,13 @@ class TestParseSebiPage:
         _, has_more = parse_sebi_page(sebi_response_text, category_id=15, current_page=2)
         assert has_more is False
 
-    def test_date_text_extracted(self, sebi_response_text):
-        """Filing dates are extracted from the first cell."""
+    def test_date_text_normalized_to_iso(self, sebi_response_text):
+        """Filing dates from SEBI are normalized to YYYY-MM-DD."""
         filings, _ = parse_sebi_page(sebi_response_text, category_id=15, current_page=0)
         main_filings = [f for f in filings if f["subcategory"] != "companion"]
         dates = {f["filing_date"] for f in main_filings}
-        assert "10-Jan-2024" in dates
-        assert "08-Jan-2024" in dates
+        assert "2024-01-10" in dates
+        assert "2024-01-08" in dates
 
     def test_filing_id_extracted_from_url(self, sebi_response_text):
         """Filing ID is extracted from the numeric part of the URL."""
