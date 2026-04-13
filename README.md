@@ -44,11 +44,22 @@ pip install -r requirements.txt
 # Crawl BSE announcements (default, easiest)
 python scraper.py crawl --source bse --max-pages 10 --download
 
+# BSE with date filter
+python scraper.py crawl --source bse --max-pages 5 --from-date 2026-04-01 --to-date 2026-04-13
+
 # Crawl NSE announcements (richer data, 150+ endpoints)
 python scraper.py crawl --source nse --max-pages 5 --download
 
+# NSE with multiple data types
+python scraper.py crawl --source nse --nse-type announcements board_meetings financial_results
+python scraper.py crawl --source nse --nse-type all  # all endpoint types
+
 # Crawl SEBI filings (IPOs, takeovers, buybacks)
 python scraper.py crawl --source sebi --max-pages 5 --sebi-category public_issues
+
+# SEBI with multiple categories
+python scraper.py crawl --source sebi --sebi-category public_issues takeovers buybacks
+python scraper.py crawl --source sebi --sebi-category all  # all 11 categories
 
 # Crawl all sources
 python scraper.py crawl --source all --max-pages 5 --download

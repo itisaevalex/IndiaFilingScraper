@@ -15,13 +15,26 @@ Part of a multi-country financial filings scraper project. Sibling scrapers: Can
 ### What Works
 
 ```bash
-python scraper.py crawl --source bse --max-pages 10 --download   # BSE announcements
-python scraper.py crawl --source nse --max-pages 5 --download    # NSE announcements
-python scraper.py crawl --source sebi --max-pages 5              # SEBI IPO/takeover filings
-python scraper.py crawl --source all --max-pages 5 --download    # All sources
-python scraper.py monitor --source bse --interval 300 --download # Live monitoring
-python scraper.py export --output filings.json                   # JSON export
-python scraper.py stats --source all                             # Cache statistics
+# BSE
+python scraper.py crawl --source bse --max-pages 10 --download
+python scraper.py crawl --source bse --from-date 2026-04-01 --to-date 2026-04-13
+
+# NSE (announcements, board meetings, financial results, annual reports)
+python scraper.py crawl --source nse --max-pages 5 --download
+python scraper.py crawl --source nse --nse-type board_meetings financial_results
+python scraper.py crawl --source nse --nse-type all
+
+# SEBI (11 categories: public issues, takeovers, buybacks, mutual funds, etc.)
+python scraper.py crawl --source sebi --sebi-category all
+python scraper.py crawl --source sebi --sebi-category public_issues takeovers buybacks
+
+# All sources
+python scraper.py crawl --source all --max-pages 5 --download
+
+# Monitor / Export / Stats
+python scraper.py monitor --source bse --interval 300 --download
+python scraper.py export --output filings.json
+python scraper.py stats --source all
 ```
 
 ### Verified Performance (2026-04-13)
@@ -29,8 +42,11 @@ python scraper.py stats --source all                             # Cache statist
 | Source | Pages | Filings | Time | Downloads |
 |--------|-------|---------|------|-----------|
 | BSE | 2 | 100 | 2.6s | — |
-| NSE | 2 (14 days) | 7,037 | 5.7s | — |
-| SEBI | 2 | 50 | 3.1s | — |
+| BSE (date filtered) | 2 | 100 | 8.0s | — |
+| NSE announcements | 1 (7 days) | 4,116 | 3.9s | — |
+| NSE board meetings | 1 | 86 | 0.8s | — |
+| NSE financial results | 1 (3 months) | 15 | 0.4s | — |
+| SEBI (all 11 categories) | 1/each | 252 | 5.7s | — |
 | BSE + download | 1 | 50 | 7.9s | 49 PDFs |
 
 ---
@@ -300,9 +316,10 @@ CLAUDE.md               # This file — methodology + reasoning trace
 
 ## Future Work
 
-- Expand NSE to use additional endpoints (annual reports, board meetings, financial results)
-- Add SEBI multi-category crawling in one run (currently single category per run)
-- Add date-range filtering for BSE (`strPrevDate`/`strToDate` params exist but not wired to CLI)
+- ~~Expand NSE to use additional endpoints~~ **DONE** — board_meetings, financial_results, annual_reports (annual_reports requires `symbol` param)
+- ~~Add SEBI multi-category crawling~~ **DONE** — `--sebi-category all` crawls all 11 categories
+- ~~Add date-range filtering for BSE~~ **DONE** — `--from-date`/`--to-date` in YYYY-MM-DD format
+- NSE annual reports requires a symbol list — add `--symbol` param or auto-fetch from NSE index endpoint
 - Consider `curl_cffi` fallback if Akamai tightens API protection
 - CFDS integration if accessible from Indian IPs (needs VPN testing)
 - XBRL filing support via BSE's `/XbrlAnnouncementCategory/w` endpoint

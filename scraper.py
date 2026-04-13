@@ -68,7 +68,13 @@ BSE_PAGE_SIZE = 50
 
 # NSE Configuration
 NSE_API_BASE = "https://www.nseindia.com/api"
-NSE_ANNOUNCEMENTS_URL = f"{NSE_API_BASE}/corporate-announcements"
+NSE_ENDPOINTS = {
+    "announcements": f"{NSE_API_BASE}/corporate-announcements",
+    "annual_reports": f"{NSE_API_BASE}/annual-reports",
+    "board_meetings": f"{NSE_API_BASE}/corporate-board-meetings",
+    "financial_results": f"{NSE_API_BASE}/corporates-financial-results",
+}
+NSE_ANNOUNCEMENTS_URL = NSE_ENDPOINTS["announcements"]
 NSE_HEADERS = {
     "Accept": "application/json, text/javascript, */*; q=0.01",
     "Accept-Language": "en-GB,en;q=0.9",
@@ -236,14 +242,17 @@ def _build_bse_doc_url(row: dict) -> str:
 # ---------------------------------------------------------------------------
 
 
-def fetch_nse_announcements(
+
+def fetch_nse_endpoint(
     session: requests.Session,
+    endpoint_type: str = "announcements",
     index_type: str = "equities",
     from_date: str = "",
     to_date: str = "",
     symbol: str = "",
 ) -> list[dict]:
-    """Fetch NSE corporate announcements. Returns list of normalized filings."""
+    """Fetch any NSE endpoint and normalize to common filing format."""
+    url = NSE_ENDPOINTS.get(endpoint_type, NSE_ENDPOINTS["announcements"])
     params: dict[str, str] = {"index": index_type}
     if from_date:
         params["from_date"] = from_date
@@ -251,58 +260,164 @@ def fetch_nse_announcements(
         params["to_date"] = to_date
     if symbol:
         params["symbol"] = symbol
+    if endpoint_type == "financial_results":
+        params["period"] = "Quarterly"
 
-    resp = session.get(
-        NSE_ANNOUNCEMENTS_URL,
-        params=params,
-        headers=NSE_HEADERS,
-        timeout=30,
-    )
+    resp = session.get(url, params=params, headers=NSE_HEADERS, timeout=30)
     resp.raise_for_status()
     data = resp.json()
 
+    # Some endpoints return a list, others return an object with a nested list
+    if isinstance(data, dict):
+        # Try common nested keys
+        for key in ("data", "results", "records"):
+            if key in data and isinstance(data[key], list):
+                data = data[key]
+                break
+        else:
+            log.warning("NSE %s: unexpected response structure", endpoint_type)
+            return []
+
     if not isinstance(data, list):
-        log.warning("NSE returned non-list response: %s", type(data).__name__)
+        log.warning("NSE %s: non-list response: %s", endpoint_type, type(data).__name__)
         return []
 
     filings = []
     for row in data:
-        att_file = row.get("attchmntFile", "").strip()
-        doc_url = att_file if att_file and att_file != "-" else ""
-
-        filings.append({
-            "source": "nse",
-            "filing_id": str(row.get("seq_id", "")),
-            "company_name": row.get("sm_name", "").strip(),
-            "symbol": row.get("symbol", "").strip(),
-            "isin": row.get("sm_isin", "").strip(),
-            "category": row.get("desc", "").strip(),
-            "subcategory": row.get("smIndustry") or "",
-            "subject": row.get("attchmntText", "").strip(),
-            "description": row.get("attchmntText", "").strip(),
-            "filing_date": row.get("sort_date", "").strip(),
-            "document_url": doc_url,
-            "file_size": str(row.get("fileSize", "") or ""),
-            "has_xbrl": bool(row.get("hasXbrl")),
-            "raw_json": json.dumps(row, ensure_ascii=False),
-        })
+        filing = _normalize_nse_record(row, endpoint_type)
+        if filing:
+            filings.append(filing)
 
     return filings
+
+
+def _normalize_nse_record(row: dict, endpoint_type: str) -> dict | None:
+    """Normalize any NSE API record to the common filing schema."""
+    # Common fields across most NSE endpoints
+    symbol = (row.get("symbol") or "").strip()
+    company = (row.get("sm_name") or row.get("companyName") or "").strip()
+    isin = (row.get("sm_isin") or row.get("isin") or "").strip()
+
+    if endpoint_type == "announcements":
+        att_file = (row.get("attchmntFile") or "").strip()
+        return {
+            "source": "nse",
+            "filing_id": str(row.get("seq_id") or ""),
+            "company_name": company,
+            "symbol": symbol,
+            "isin": isin,
+            "category": (row.get("desc") or "").strip(),
+            "subcategory": row.get("smIndustry") or "",
+            "subject": (row.get("attchmntText") or "").strip(),
+            "description": (row.get("attchmntText") or "").strip(),
+            "filing_date": (row.get("sort_date") or "").strip(),
+            "document_url": att_file if att_file and att_file != "-" else "",
+            "file_size": str(row.get("fileSize") or ""),
+            "has_xbrl": bool(row.get("hasXbrl")),
+            "raw_json": json.dumps(row, ensure_ascii=False),
+        }
+
+    elif endpoint_type == "annual_reports":
+        doc_url = (row.get("fileName") or "").strip()
+        from_yr = row.get("fromYr") or ""
+        to_yr = row.get("toYr") or ""
+        return {
+            "source": "nse",
+            "filing_id": f"ar_{symbol}_{from_yr}_{to_yr}",
+            "company_name": company,
+            "symbol": symbol,
+            "isin": isin,
+            "category": "Annual Report",
+            "subcategory": f"{from_yr}-{to_yr}",
+            "subject": f"Annual Report {from_yr}-{to_yr} - {company}",
+            "description": "",
+            "filing_date": (row.get("broadcast_dttm") or "").strip(),
+            "document_url": doc_url if doc_url and doc_url != "-" else "",
+            "file_size": str(row.get("attFileSize") or ""),
+            "has_xbrl": False,
+            "raw_json": json.dumps(row, ensure_ascii=False),
+        }
+
+    elif endpoint_type == "board_meetings":
+        # Note: NSE has field typo "sm_indusrty" (not "sm_industry")
+        att_file = (row.get("attachment") or "").strip()
+        bm_symbol = (row.get("bm_symbol") or symbol).strip()
+        return {
+            "source": "nse",
+            "filing_id": f"bm_{bm_symbol}_{row.get('bm_timestamp', '')}",
+            "company_name": (row.get("sm_name") or company).strip(),
+            "symbol": bm_symbol,
+            "isin": (row.get("sm_isin") or isin).strip(),
+            "category": "Board Meeting",
+            "subcategory": (row.get("bm_purpose") or "").strip(),
+            "subject": (row.get("bm_purpose") or "").strip(),
+            "description": (row.get("bm_desc") or "").strip(),
+            "filing_date": (row.get("bm_timestamp") or row.get("bm_date") or "").strip(),
+            "document_url": att_file if att_file and att_file != "-" else "",
+            "file_size": str(row.get("attFileSize") or ""),
+            "has_xbrl": bool(att_file),
+            "raw_json": json.dumps(row, ensure_ascii=False),
+        }
+
+    elif endpoint_type == "financial_results":
+        xbrl_url = (row.get("xbrl") or "").strip()
+        doc_url = xbrl_url if xbrl_url and not xbrl_url.endswith("/-") else ""
+        return {
+            "source": "nse",
+            "filing_id": f"fr_{row.get('seqNumber', '')}",
+            "company_name": company,
+            "symbol": symbol,
+            "isin": (row.get("isin") or isin).strip(),
+            "category": "Financial Results",
+            "subcategory": (row.get("relatingTo") or "").strip(),
+            "subject": f"{row.get('relatingTo', '')} Results - {company} ({row.get('audited', '')})",
+            "description": (row.get("resultDescription") or "").strip(),
+            "filing_date": (row.get("filingDate") or row.get("broadCastDate") or "").strip(),
+            "document_url": doc_url,
+            "file_size": "",
+            "has_xbrl": bool(doc_url),
+            "raw_json": json.dumps(row, ensure_ascii=False),
+        }
+
+    return None
 
 
 def fetch_nse_paginated(
     session: requests.Session,
     max_pages: int = 10,
+    endpoint_type: str = "announcements",
     index_type: str = "equities",
     symbol: str = "",
     days_per_page: int = 7,
+    from_date_override: str = "",
+    to_date_override: str = "",
 ) -> list[dict]:
     """Paginate NSE by date ranges (no built-in page param).
 
     NSE returns all results for a date range in one response.
     We paginate by sliding the date window backwards.
+    If from_date_override/to_date_override are set, fetches that single range only.
     """
     all_filings: list[dict] = []
+
+    # Single date range mode (explicit --from-date/--to-date)
+    if from_date_override or to_date_override:
+        log.info(
+            "NSE %s: %s to %s",
+            endpoint_type, from_date_override or "start", to_date_override or "now",
+        )
+        try:
+            filings = fetch_nse_endpoint(
+                session, endpoint_type=endpoint_type, index_type=index_type,
+                from_date=from_date_override, to_date=to_date_override, symbol=symbol,
+            )
+            all_filings.extend(filings)
+            log.info("  %d filings", len(filings))
+        except (requests.RequestException, ValueError) as e:
+            log.warning("NSE %s fetch failed: %s", endpoint_type, e)
+        return all_filings
+
+    # Sliding window pagination
     end_date = datetime.now()
 
     for page in range(max_pages):
@@ -310,26 +425,20 @@ def fetch_nse_paginated(
         from_str = start_date.strftime("%d-%m-%Y")
         to_str = end_date.strftime("%d-%m-%Y")
 
-        log.info(
-            "NSE page %d: %s to %s",
-            page + 1, from_str, to_str,
-        )
+        log.info("NSE %s page %d: %s to %s", endpoint_type, page + 1, from_str, to_str)
 
         try:
-            filings = fetch_nse_announcements(
-                session,
-                index_type=index_type,
-                from_date=from_str,
-                to_date=to_str,
-                symbol=symbol,
+            filings = fetch_nse_endpoint(
+                session, endpoint_type=endpoint_type, index_type=index_type,
+                from_date=from_str, to_date=to_str, symbol=symbol,
             )
         except (requests.RequestException, ValueError) as e:
-            log.warning("NSE fetch failed for %s to %s: %s — skipping", from_str, to_str, e)
+            log.warning("NSE %s fetch failed for %s to %s: %s — skipping", endpoint_type, from_str, to_str, e)
             end_date = start_date - timedelta(days=1)
             continue
 
         if not filings:
-            log.info("NSE: no filings for %s to %s. Stopping.", from_str, to_str)
+            log.info("NSE %s: no filings for %s to %s. Stopping.", endpoint_type, from_str, to_str)
             break
 
         all_filings.extend(filings)
@@ -754,15 +863,18 @@ def cmd_crawl(args):
             if source == "bse":
                 total_f, new_f, dl_f = _crawl_bse(
                     session, cache, doc_dir, args.max_pages, args.download, args.parallel,
+                    from_date=args.from_date, to_date=args.to_date,
                 )
             elif source == "nse":
                 total_f, new_f, dl_f = _crawl_nse(
                     session, cache, doc_dir, args.max_pages, args.download, args.parallel,
+                    nse_types=args.nse_type,
+                    from_date=args.from_date, to_date=args.to_date,
                 )
             elif source == "sebi":
                 total_f, new_f, dl_f = _crawl_sebi(
                     session, cache, doc_dir, args.max_pages, args.download, args.parallel,
-                    category=args.sebi_category,
+                    categories=args.sebi_category,
                 )
             else:
                 log.error("Unknown source: %s", source)
@@ -788,16 +900,25 @@ def _crawl_bse(
     max_pages: int,
     download: bool,
     parallel: int,
+    from_date: str = "",
+    to_date: str = "",
 ) -> tuple[int, int, int]:
     """Crawl BSE announcements. Returns (total, new, downloaded)."""
     total_f = total_new = total_dl = 0
+    search_type = "A" if (from_date or to_date) else "P"
+
+    if from_date or to_date:
+        log.info("BSE date filter: %s to %s", from_date or "start", to_date or "now")
 
     for page_num in range(1, max_pages + 1):
         if page_num > 1:
             time.sleep(DELAY_BETWEEN_PAGES)
 
         try:
-            filings, total_count = fetch_bse_page(session, page_num=page_num)
+            filings, total_count = fetch_bse_page(
+                session, page_num=page_num,
+                from_date=from_date, to_date=to_date, search_type=search_type,
+            )
         except (requests.RequestException, ValueError) as e:
             log.warning("BSE page %d fetch failed: %s — skipping", page_num, e)
             continue
@@ -834,17 +955,35 @@ def _crawl_nse(
     max_pages: int,
     download: bool,
     parallel: int,
+    nse_types: list[str] | None = None,
+    from_date: str = "",
+    to_date: str = "",
 ) -> tuple[int, int, int]:
-    """Crawl NSE announcements via date-range pagination."""
-    filings = fetch_nse_paginated(session, max_pages=max_pages)
-    new = cache.insert_batch(filings)
-    total_dl = 0
+    """Crawl NSE filings via date-range pagination, optionally multi-type."""
+    if not nse_types:
+        nse_types = ["announcements"]
+    if "all" in nse_types:
+        nse_types = list(NSE_ENDPOINTS.keys())
 
-    if download and filings:
-        total_dl = download_filings(session, filings, doc_dir, cache, parallel)
+    total_f = total_new = total_dl = 0
 
-    log.info("NSE: %d filings (%d new), %d downloaded", len(filings), new, total_dl)
-    return len(filings), new, total_dl
+    for nse_type in nse_types:
+        log.info("--- NSE: %s ---", nse_type)
+        filings = fetch_nse_paginated(
+            session, max_pages=max_pages, endpoint_type=nse_type,
+            from_date_override=from_date, to_date_override=to_date,
+        )
+        new = cache.insert_batch(filings)
+        total_f += len(filings)
+        total_new += new
+
+        if download and filings:
+            dl = download_filings(session, filings, doc_dir, cache, parallel)
+            total_dl += dl
+
+        log.info("NSE %s: %d filings (%d new), %d downloaded", nse_type, len(filings), new, total_dl)
+
+    return total_f, total_new, total_dl
 
 
 def _crawl_sebi(
@@ -854,13 +993,44 @@ def _crawl_sebi(
     max_pages: int,
     download: bool,
     parallel: int,
-    category: str = "public_issues",
+    categories: list[str] | None = None,
 ) -> tuple[int, int, int]:
-    """Crawl SEBI filings for a given category."""
-    category_id = SEBI_CATEGORIES.get(category, 15)
+    """Crawl SEBI filings for one or more categories."""
+    if not categories:
+        categories = ["public_issues"]
+    if "all" in categories:
+        categories = list(SEBI_CATEGORIES.keys())
+
     total_f = total_new = total_dl = 0
 
-    category_name = SEBI_CATEGORY_NAMES.get(category_id, f"Category {category_id}")
+    for category in categories:
+        category_id = SEBI_CATEGORIES.get(category, 15)
+        category_name = SEBI_CATEGORY_NAMES.get(category_id, f"Category {category_id}")
+        log.info("--- SEBI: %s ---", category_name)
+
+        cat_f, cat_new, cat_dl = _crawl_sebi_category(
+            session, cache, doc_dir, max_pages, download, parallel,
+            category_id, category_name,
+        )
+        total_f += cat_f
+        total_new += cat_new
+        total_dl += cat_dl
+
+    return total_f, total_new, total_dl
+
+
+def _crawl_sebi_category(
+    session: requests.Session,
+    cache: FilingCache,
+    doc_dir: str,
+    max_pages: int,
+    download: bool,
+    parallel: int,
+    category_id: int,
+    category_name: str,
+) -> tuple[int, int, int]:
+    """Crawl SEBI filings for a single category."""
+    total_f = total_new = total_dl = 0
 
     for page_num in range(max_pages):
         if page_num > 0:
@@ -933,7 +1103,7 @@ def cmd_monitor(args):
             if args.source in ("nse", "all"):
                 today = datetime.now()
                 yesterday = today - timedelta(days=1)
-                filings = fetch_nse_announcements(
+                filings = fetch_nse_endpoint(
                     session,
                     from_date=yesterday.strftime("%d-%m-%Y"),
                     to_date=today.strftime("%d-%m-%Y"),
@@ -1019,9 +1189,22 @@ def main():
     c.add_argument("--doc-dir", default="documents")
     c.add_argument("--db", default=DB_FILE)
     c.add_argument(
-        "--sebi-category", default="public_issues",
-        choices=list(SEBI_CATEGORIES.keys()),
-        help="SEBI filing category (default: public_issues)",
+        "--from-date", default="",
+        help="Start date (BSE: YYYY-MM-DD, NSE: DD-MM-YYYY)",
+    )
+    c.add_argument(
+        "--to-date", default="",
+        help="End date (BSE: YYYY-MM-DD, NSE: DD-MM-YYYY)",
+    )
+    c.add_argument(
+        "--sebi-category", nargs="+", default=["public_issues"],
+        choices=list(SEBI_CATEGORIES.keys()) + ["all"],
+        help="SEBI filing categories (default: public_issues, use 'all' for everything)",
+    )
+    c.add_argument(
+        "--nse-type", nargs="+", default=["announcements"],
+        choices=["announcements", "annual_reports", "board_meetings", "financial_results", "all"],
+        help="NSE data types to crawl (default: announcements)",
     )
 
     # monitor
