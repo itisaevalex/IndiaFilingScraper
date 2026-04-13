@@ -1,0 +1,458 @@
+"""
+test_parsers.py — Unit tests for all 3 source parsers and type classification.
+
+Tests:
+  - BSE JSON response parsing + PDFFLAG URL routing
+  - NSE JSON response parsing (all 4 endpoint types)
+  - SEBI HTML/#@# response parsing
+  - classify_filing_type() across all sources
+"""
+
+from __future__ import annotations
+
+import json
+import sys
+import os
+
+import pytest
+
+# Ensure project root is on sys.path
+sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
+
+from parsers import (
+    build_bse_doc_url,
+    classify_filing_type,
+    parse_bse_response,
+    parse_nse_response,
+    parse_sebi_page,
+    sebi_has_next_page,
+    SEBI_CATEGORY_NAMES,
+    SEBI_DOC_BASE,
+)
+
+
+# ===========================================================================
+# BSE parser tests
+# ===========================================================================
+
+
+class TestBseBuildDocUrl:
+    """Tests for build_bse_doc_url() PDFFLAG routing."""
+
+    def test_pdfflag_0_uses_attachlive(self):
+        """PDFFLAG=0 routes to AttachLive directory."""
+        row = {"ATTACHMENTNAME": "test.pdf", "PDFFLAG": "0"}
+        url = build_bse_doc_url(row)
+        assert "AttachLive" in url
+        assert url.endswith("test.pdf")
+
+    def test_pdfflag_1_uses_attachhis(self):
+        """PDFFLAG=1 routes to AttachHis (historical) directory."""
+        row = {"ATTACHMENTNAME": "old_report.pdf", "PDFFLAG": "1"}
+        url = build_bse_doc_url(row)
+        assert "AttachHis" in url
+        assert url.endswith("old_report.pdf")
+
+    def test_pdfflag_2_uses_corpattachment_with_date(self):
+        """PDFFLAG=2 routes to CorpAttachment/<year>/<month>/<filename>."""
+        row = {
+            "ATTACHMENTNAME": "corp_filing.pdf",
+            "PDFFLAG": "2",
+            "NEWS_DT": "15/03/2024 10:00:00",
+        }
+        url = build_bse_doc_url(row)
+        assert "CorpAttachment" in url
+        assert "2024" in url
+        assert "3" in url
+        assert url.endswith("corp_filing.pdf")
+
+    def test_pdfflag_2_bad_date_returns_empty(self):
+        """PDFFLAG=2 with unparseable date returns empty string."""
+        row = {
+            "ATTACHMENTNAME": "test.pdf",
+            "PDFFLAG": "2",
+            "NEWS_DT": "NOT_A_DATE",
+        }
+        url = build_bse_doc_url(row)
+        assert url == ""
+
+    def test_empty_attachment_returns_empty(self):
+        """Missing ATTACHMENTNAME returns empty string regardless of PDFFLAG."""
+        row = {"ATTACHMENTNAME": "", "PDFFLAG": "0"}
+        assert build_bse_doc_url(row) == ""
+
+    def test_missing_attachment_key_returns_empty(self):
+        """Missing ATTACHMENTNAME key returns empty string."""
+        row = {"PDFFLAG": "0"}
+        assert build_bse_doc_url(row) == ""
+
+    def test_unknown_pdfflag_falls_back_to_attachlive(self):
+        """Unknown PDFFLAG value falls back to AttachLive."""
+        row = {"ATTACHMENTNAME": "file.pdf", "PDFFLAG": "99"}
+        url = build_bse_doc_url(row)
+        assert "AttachLive" in url
+
+    def test_pdfflag_missing_defaults_to_0(self):
+        """Missing PDFFLAG key defaults to AttachLive (flag=0 behavior)."""
+        row = {"ATTACHMENTNAME": "file.pdf"}
+        url = build_bse_doc_url(row)
+        assert "AttachLive" in url
+
+
+class TestParseBseResponse:
+    """Tests for parse_bse_response() full response parsing."""
+
+    def test_parses_filings_from_table(self, bse_response_data):
+        """Parses all rows in the Table array into filing dicts."""
+        filings, total = parse_bse_response(bse_response_data)
+        assert len(filings) == 4
+        assert total == 1250
+
+    def test_filing_schema_completeness(self, bse_response_data):
+        """Every parsed filing has all required schema fields."""
+        filings, _ = parse_bse_response(bse_response_data)
+        required = {
+            "source", "filing_id", "company_name", "symbol", "isin",
+            "category", "subcategory", "subject", "description",
+            "filing_date", "document_url", "file_size", "has_xbrl", "raw_json",
+        }
+        for f in filings:
+            assert required.issubset(f.keys()), f"Missing keys: {required - f.keys()}"
+
+    def test_source_is_bse(self, bse_response_data):
+        """All parsed filings have source='bse'."""
+        filings, _ = parse_bse_response(bse_response_data)
+        assert all(f["source"] == "bse" for f in filings)
+
+    def test_pdfflag0_url_in_attachlive(self, bse_response_data):
+        """Row with PDFFLAG=0 gets an AttachLive document URL."""
+        filings, _ = parse_bse_response(bse_response_data)
+        ril = next(f for f in filings if f["symbol"] == "500325")
+        assert "AttachLive" in ril["document_url"]
+
+    def test_pdfflag1_url_in_attachhis(self, bse_response_data):
+        """Row with PDFFLAG=1 gets an AttachHis document URL."""
+        filings, _ = parse_bse_response(bse_response_data)
+        tcs = next(f for f in filings if f["symbol"] == "532540")
+        assert "AttachHis" in tcs["document_url"]
+
+    def test_pdfflag2_url_in_corpattachment(self, bse_response_data):
+        """Row with PDFFLAG=2 gets a CorpAttachment URL with year/month."""
+        filings, _ = parse_bse_response(bse_response_data)
+        infy = next(f for f in filings if f["symbol"] == "500209")
+        assert "CorpAttachment" in infy["document_url"]
+
+    def test_empty_attachment_gives_no_url(self, bse_response_data):
+        """Row with empty ATTACHMENTNAME gets empty document_url."""
+        filings, _ = parse_bse_response(bse_response_data)
+        hdfc = next(f for f in filings if f["symbol"] == "500180")
+        assert hdfc["document_url"] == ""
+
+    def test_total_count_from_table1(self, bse_response_data):
+        """Total row count is extracted from Table1[0].ROWCNT."""
+        _, total = parse_bse_response(bse_response_data)
+        assert total == 1250
+
+    def test_empty_table1_gives_zero_total(self):
+        """Missing Table1 gives total=0."""
+        _, total = parse_bse_response({"Table": [], "Table1": []})
+        assert total == 0
+
+    def test_empty_response_gives_empty_filings(self):
+        """Empty Table array gives empty filings list."""
+        filings, total = parse_bse_response({"Table": [], "Table1": []})
+        assert filings == []
+        assert total == 0
+
+    def test_raw_json_is_valid_json(self, bse_response_data):
+        """The raw_json field in each filing is valid JSON."""
+        filings, _ = parse_bse_response(bse_response_data)
+        for f in filings:
+            parsed = json.loads(f["raw_json"])
+            assert isinstance(parsed, dict)
+
+
+# ===========================================================================
+# NSE parser tests
+# ===========================================================================
+
+
+class TestParseNseResponse:
+    """Tests for parse_nse_response() across all 4 endpoint types."""
+
+    def test_announcements_list_input(self, nse_announcements_data):
+        """Parses a bare list response for announcements endpoint."""
+        filings = parse_nse_response(nse_announcements_data, "announcements")
+        assert len(filings) == 3
+
+    def test_announcements_source_is_nse(self, nse_announcements_data):
+        """All announcement filings have source='nse'."""
+        filings = parse_nse_response(nse_announcements_data, "announcements")
+        assert all(f["source"] == "nse" for f in filings)
+
+    def test_announcements_dash_url_becomes_empty(self, nse_announcements_data):
+        """attchmntFile='-' results in empty document_url."""
+        filings = parse_nse_response(nse_announcements_data, "announcements")
+        wipro = next(f for f in filings if f["symbol"] == "WIPRO")
+        assert wipro["document_url"] == ""
+
+    def test_announcements_valid_url_preserved(self, nse_announcements_data):
+        """Valid attchmntFile URL is preserved as document_url."""
+        filings = parse_nse_response(nse_announcements_data, "announcements")
+        reliance = next(f for f in filings if f["symbol"] == "RELIANCE")
+        assert reliance["document_url"].startswith("https://")
+
+    def test_announcements_dict_input_with_data_key(self, nse_announcements_data):
+        """Parses a dict response with a 'data' key wrapping the list."""
+        wrapped = {"data": nse_announcements_data, "extra": "ignored"}
+        filings = parse_nse_response(wrapped, "announcements")
+        assert len(filings) == 3
+
+    def test_announcements_dict_input_with_results_key(self, nse_announcements_data):
+        """Parses a dict response with a 'results' key."""
+        wrapped = {"results": nse_announcements_data}
+        filings = parse_nse_response(wrapped, "announcements")
+        assert len(filings) == 3
+
+    def test_announcements_unexpected_dict_returns_empty(self):
+        """Dict without known list key returns empty list."""
+        filings = parse_nse_response({"foo": "bar"}, "announcements")
+        assert filings == []
+
+    def test_announcements_non_list_returns_empty(self):
+        """Non-list, non-dict input returns empty list."""
+        filings = parse_nse_response("invalid", "announcements")
+        assert filings == []
+
+    def test_annual_reports_parsing(self, nse_annual_reports_data):
+        """Parses annual_reports endpoint into correct schema."""
+        filings = parse_nse_response(nse_annual_reports_data, "annual_reports")
+        assert len(filings) == 1
+        f = filings[0]
+        assert f["category"] == "Annual Report"
+        assert "2022" in f["subject"]
+        assert "2023" in f["subject"]
+        assert f["filing_id"] == "ar_INFY_2022_2023"
+
+    def test_annual_reports_dash_url_becomes_empty(self):
+        """fileName='-' results in empty document_url for annual_reports."""
+        data = [{"symbol": "TEST", "sm_name": "Test", "fromYr": "2023",
+                 "toYr": "2024", "fileName": "-"}]
+        filings = parse_nse_response(data, "annual_reports")
+        assert filings[0]["document_url"] == ""
+
+    def test_board_meetings_parsing(self, nse_board_meetings_data):
+        """Parses board_meetings endpoint into correct schema."""
+        filings = parse_nse_response(nse_board_meetings_data, "board_meetings")
+        assert len(filings) == 1
+        f = filings[0]
+        assert f["category"] == "Board Meeting"
+        assert f["symbol"] == "HDFCBANK"
+        assert "HDFCBANK" in f["filing_id"]
+
+    def test_board_meetings_has_xbrl_when_attachment_present(self, nse_board_meetings_data):
+        """has_xbrl is True when attachment field is non-empty."""
+        filings = parse_nse_response(nse_board_meetings_data, "board_meetings")
+        assert filings[0]["has_xbrl"] is True
+
+    def test_financial_results_parsing(self, nse_financial_results_data):
+        """Parses financial_results endpoint into correct schema."""
+        filings = parse_nse_response(nse_financial_results_data, "financial_results")
+        assert len(filings) == 2
+
+    def test_financial_results_xbrl_url_valid(self, nse_financial_results_data):
+        """Valid XBRL URL is preserved as document_url."""
+        filings = parse_nse_response(nse_financial_results_data, "financial_results")
+        axisbank = next(f for f in filings if f["symbol"] == "AXISBANK")
+        assert axisbank["document_url"].endswith(".xml")
+        assert axisbank["has_xbrl"] is True
+
+    def test_financial_results_xbrl_slash_dash_becomes_empty(self, nse_financial_results_data):
+        """XBRL URL ending in /- results in empty document_url."""
+        filings = parse_nse_response(nse_financial_results_data, "financial_results")
+        kotak = next(f for f in filings if f["symbol"] == "KOTAKBANK")
+        assert kotak["document_url"] == ""
+        assert kotak["has_xbrl"] is False
+
+    def test_unknown_endpoint_returns_empty(self, nse_announcements_data):
+        """Unknown endpoint_type returns empty list (no match in _normalize_nse_record)."""
+        filings = parse_nse_response(nse_announcements_data, "unknown_type")
+        assert filings == []
+
+
+# ===========================================================================
+# SEBI parser tests
+# ===========================================================================
+
+
+class TestSebiHasNextPage:
+    """Tests for sebi_has_next_page() pagination detection."""
+
+    def test_totalpage_hidden_input_parsed(self):
+        """Parses totalpage hidden input to detect more pages."""
+        html = "<input type='hidden' name='totalpage' value=5 />"
+        assert sebi_has_next_page(html, current_page=0) is True
+        assert sebi_has_next_page(html, current_page=3) is True
+        assert sebi_has_next_page(html, current_page=4) is False
+
+    def test_no_totalpage_uses_next_link_fallback(self):
+        """Falls back to checking for Next JS link when totalpage absent."""
+        html = "javascript: searchFormNewsList('n'"
+        assert sebi_has_next_page(html, current_page=0) is True
+
+    def test_no_pagination_markers_returns_false(self):
+        """Returns False when no pagination markers are present."""
+        assert sebi_has_next_page("<html></html>", current_page=0) is False
+
+    def test_last_page_is_false(self):
+        """Returns False when current_page is the last page."""
+        html = "<input type='hidden' name='totalpage' value=3 />"
+        assert sebi_has_next_page(html, current_page=2) is False
+
+
+class TestParseSebiPage:
+    """Tests for parse_sebi_page() full SEBI response parsing."""
+
+    def test_parses_main_filings(self, sebi_response_text):
+        """Parses main filing links from all tr[role='row'] rows."""
+        filings, has_more = parse_sebi_page(sebi_response_text, category_id=15, current_page=0)
+        main_filings = [f for f in filings if f["subcategory"] != "companion"]
+        assert len(main_filings) == 3
+
+    def test_parses_companion_documents(self, sebi_response_text):
+        """Companion PDF links create additional filing records."""
+        filings, has_more = parse_sebi_page(sebi_response_text, category_id=15, current_page=0)
+        companions = [f for f in filings if f["subcategory"] == "companion"]
+        # Row 1 has 1 companion, Row 3 has 2 companions = 3 companions total
+        assert len(companions) == 3
+
+    def test_source_is_sebi(self, sebi_response_text):
+        """All parsed filings have source='sebi'."""
+        filings, _ = parse_sebi_page(sebi_response_text, category_id=15, current_page=0)
+        assert all(f["source"] == "sebi" for f in filings)
+
+    def test_category_name_populated(self, sebi_response_text):
+        """Category field is set to the human-readable category name."""
+        filings, _ = parse_sebi_page(sebi_response_text, category_id=15, current_page=0)
+        assert all(f["category"] == "Public Issues" for f in filings)
+
+    def test_relative_urls_prefixed_with_sebi_base(self, sebi_response_text):
+        """Relative hrefs are prefixed with SEBI_DOC_BASE."""
+        filings, _ = parse_sebi_page(sebi_response_text, category_id=15, current_page=0)
+        for f in filings:
+            assert f["document_url"].startswith("http"), f"Non-absolute URL: {f['document_url']}"
+
+    def test_absolute_urls_not_double_prefixed(self, sebi_response_text):
+        """Absolute hrefs are not double-prefixed."""
+        filings, _ = parse_sebi_page(sebi_response_text, category_id=15, current_page=0)
+        for f in filings:
+            assert not f["document_url"].startswith(f"{SEBI_DOC_BASE}{SEBI_DOC_BASE}")
+
+    def test_has_more_is_true_when_more_pages(self, sebi_response_text):
+        """has_more is True when current_page < total_pages - 1."""
+        _, has_more = parse_sebi_page(sebi_response_text, category_id=15, current_page=0)
+        assert has_more is True
+
+    def test_has_more_false_on_last_page(self, sebi_response_text):
+        """has_more is False when current_page equals total_pages - 1."""
+        _, has_more = parse_sebi_page(sebi_response_text, category_id=15, current_page=2)
+        assert has_more is False
+
+    def test_date_text_extracted(self, sebi_response_text):
+        """Filing dates are extracted from the first cell."""
+        filings, _ = parse_sebi_page(sebi_response_text, category_id=15, current_page=0)
+        main_filings = [f for f in filings if f["subcategory"] != "companion"]
+        dates = {f["filing_date"] for f in main_filings}
+        assert "10-Jan-2024" in dates
+        assert "08-Jan-2024" in dates
+
+    def test_filing_id_extracted_from_url(self, sebi_response_text):
+        """Filing ID is extracted from the numeric part of the URL."""
+        filings, _ = parse_sebi_page(sebi_response_text, category_id=15, current_page=0)
+        ids = {f["filing_id"] for f in filings if f["subcategory"] != "companion"}
+        assert "12345" in ids
+        assert "12344" in ids
+
+    def test_empty_html_returns_no_filings(self):
+        """Empty HTML content returns empty filings list."""
+        empty_response = "   #@#extra"
+        filings, _ = parse_sebi_page(empty_response, category_id=15, current_page=0)
+        assert filings == []
+
+    def test_hash_at_hash_delimiter_split(self):
+        """Response is split at #@# and only the first part is parsed as HTML."""
+        html_part = (
+            "<table><tr role='row'><td>01-Jan-2024</td>"
+            "<td><a href='/test_99999.html'>Test Filing</a></td></tr></table>"
+        )
+        response = f"{html_part}#@#this_should_be_ignored#@#also_ignored"
+        filings, _ = parse_sebi_page(response, category_id=15, current_page=0)
+        assert len(filings) == 1
+
+
+# ===========================================================================
+# classify_filing_type tests
+# ===========================================================================
+
+
+class TestClassifyFilingType:
+    """Tests for classify_filing_type() across all sources."""
+
+    @pytest.mark.parametrize(
+        "headline, expected",
+        [
+            ("Annual Report 2023-2024", "Annual Report"),
+            ("Q3 FY2024 Financial Results", "Financial Results"),
+            ("Quarterly Results for Dec 2023", "Financial Results"),
+            ("Board Meeting Intimation", "Board Meeting"),
+            ("Annual General Meeting Notice", "AGM/EGM"),
+            ("EGM Notice", "AGM/EGM"),
+            ("Declaration of Interim Dividend", "Dividend"),
+            ("Final Dividend for FY2024", "Dividend"),
+            ("Open Offer - Takeover of XYZ Corp", "Takeover / Merger"),
+            ("Scheme of Arrangement between ABC and PQR", "Takeover / Merger"),
+            ("Amalgamation Proposal", "Takeover / Merger"),
+            ("Draft Red Herring Prospectus - IPO", "IPO / Rights Issue"),
+            ("Rights Issue Open", "IPO / Rights Issue"),
+            ("Initial Public Offer Document", "IPO / Rights Issue"),
+            ("Buyback of Equity Shares", "Buyback"),
+            ("Buy-back offer document", "Buyback"),
+            ("XBRL Financial Data Submission", "XBRL Filing"),
+            ("Credit Rating Upgrade to AA+", "Credit Rating"),
+            ("Appointment of New Director", "Change in Management"),
+            ("Resignation of CFO", "Change in Management"),
+            ("Outcome of Board Meeting Held Today", "Outcome of Meeting"),
+            ("Newspaper Publication of Results", "Newspaper Publication"),
+            ("Shareholding Pattern Q3 FY24", "Regulatory Filing"),
+            ("LODR Compliance Certificate", "Regulatory Filing"),
+            ("Insider Trading Policy Update", "Insider Trading"),
+            ("Random unknown text about company XYZ", "Other"),
+            ("", "Other"),
+        ],
+    )
+    def test_classification(self, headline, expected):
+        """Verify filing type classification for various headlines."""
+        result = classify_filing_type(headline)
+        assert result == expected, f"headline={headline!r}: got {result!r}, want {expected!r}"
+
+    def test_case_insensitive(self):
+        """Classification is case-insensitive."""
+        assert classify_filing_type("ANNUAL REPORT") == "Annual Report"
+        assert classify_filing_type("annual report") == "Annual Report"
+        assert classify_filing_type("Annual Report") == "Annual Report"
+
+    def test_none_like_empty_returns_other(self):
+        """Empty string returns 'Other'."""
+        assert classify_filing_type("") == "Other"
+
+    def test_bse_category_mapped(self):
+        """BSE 'Quarterly Results' category maps to Financial Results."""
+        assert classify_filing_type("Quarterly Results for Q3") == "Financial Results"
+
+    def test_nse_annual_report_subject(self):
+        """NSE annual report subject maps to Annual Report."""
+        assert classify_filing_type("Annual Report 2022-2023 - Infosys Ltd") == "Annual Report"
+
+    def test_sebi_public_issue_subject(self):
+        """SEBI public issue title maps to IPO / Rights Issue."""
+        assert classify_filing_type("Draft Red Herring Prospectus - XYZ Technologies Ltd") == "IPO / Rights Issue"

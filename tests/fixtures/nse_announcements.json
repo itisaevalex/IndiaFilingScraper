@@ -1,0 +1,41 @@
+[
+  {
+    "seq_id": "20240101_001",
+    "symbol": "RELIANCE",
+    "sm_name": "Reliance Industries Ltd",
+    "sm_isin": "INE002A01018",
+    "desc": "Board Meeting",
+    "smIndustry": "Oil, Gas & Consumable Fuels",
+    "attchmntText": "Intimation of Board Meeting",
+    "sort_date": "2024-01-01T10:00:00",
+    "attchmntFile": "https://nsearchives.nseindia.com/corporate/xbrl/RELIANCE_2024_board.pdf",
+    "fileSize": "125678",
+    "hasXbrl": false
+  },
+  {
+    "seq_id": "20240101_002",
+    "symbol": "TCS",
+    "sm_name": "Tata Consultancy Services Ltd",
+    "sm_isin": "INE467B01029",
+    "desc": "Financial Results",
+    "smIndustry": "IT",
+    "attchmntText": "Q3 FY2024 Financial Results",
+    "sort_date": "2024-01-01T11:30:00",
+    "attchmntFile": "https://nsearchives.nseindia.com/corporate/xbrl/TCS_Q3FY24.pdf",
+    "fileSize": "2456789",
+    "hasXbrl": true
+  },
+  {
+    "seq_id": "20240101_003",
+    "symbol": "WIPRO",
+    "sm_name": "Wipro Ltd",
+    "sm_isin": "INE075A01022",
+    "desc": "Corporate Action",
+    "smIndustry": "IT",
+    "attchmntText": "Interim Dividend Declaration",
+    "sort_date": "2024-01-01T12:00:00",
+    "attchmntFile": "-",
+    "fileSize": "",
+    "hasXbrl": false
+  }
+]

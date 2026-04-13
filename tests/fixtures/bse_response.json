@@ -1,0 +1,61 @@
+{
+  "Table": [
+    {
+      "NEWSID": "20240101001",
+      "SLONGNAME": "Reliance Industries Ltd",
+      "SCRIP_CD": "500325",
+      "CATEGORYNAME": "Board Meeting",
+      "SUBCATNAME": "Board Meeting Intimation",
+      "NEWSSUB": "Board Meeting Intimation",
+      "HEADLINE": "Intimation of Board Meeting scheduled on 15-01-2024",
+      "NEWS_DT": "01/01/2024 10:00:00",
+      "ATTACHMENTNAME": "20240101_RIL_BoardMeeting.pdf",
+      "PDFFLAG": "0",
+      "Fld_Attachsize": "125678"
+    },
+    {
+      "NEWSID": "20240101002",
+      "SLONGNAME": "Tata Consultancy Services Ltd",
+      "SCRIP_CD": "532540",
+      "CATEGORYNAME": "Financial Results",
+      "SUBCATNAME": "Quarterly Results",
+      "NEWSSUB": "Quarterly Financial Results Q3 FY24",
+      "HEADLINE": "TCS Q3 FY2024 Financial Results",
+      "NEWS_DT": "01/01/2024 11:30:00",
+      "ATTACHMENTNAME": "TCS_Q3FY24_Results.pdf",
+      "PDFFLAG": "1",
+      "Fld_Attachsize": "2456789"
+    },
+    {
+      "NEWSID": "20240101003",
+      "SLONGNAME": "Infosys Ltd",
+      "SCRIP_CD": "500209",
+      "CATEGORYNAME": "Corp Action",
+      "SUBCATNAME": "Dividend",
+      "NEWSSUB": "Declaration of Interim Dividend",
+      "HEADLINE": "Interim Dividend declared for FY2024",
+      "NEWS_DT": "01/01/2024 12:00:00",
+      "ATTACHMENTNAME": "INFY_Dividend_Notice.pdf",
+      "PDFFLAG": "2",
+      "Fld_Attachsize": "98765"
+    },
+    {
+      "NEWSID": "20240101004",
+      "SLONGNAME": "HDFC Bank Ltd",
+      "SCRIP_CD": "500180",
+      "CATEGORYNAME": "Shareholding Pattern",
+      "SUBCATNAME": "Shareholding Pattern",
+      "NEWSSUB": "Shareholding Pattern for Q3 FY24",
+      "HEADLINE": "Shareholding Pattern Dec 2023",
+      "NEWS_DT": "01/01/2024 14:00:00",
+      "ATTACHMENTNAME": "",
+      "PDFFLAG": "0",
+      "Fld_Attachsize": ""
+    }
+  ],
+  "Table1": [
+    {
+      "ROWCNT": "1250"
+    }
+  ]
+}

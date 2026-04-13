@@ -1,0 +1,28 @@
+[
+  {
+    "seqNumber": "FR_2024_001",
+    "symbol": "AXISBANK",
+    "sm_name": "Axis Bank Ltd",
+    "sm_isin": "INE238A01034",
+    "isin": "INE238A01034",
+    "relatingTo": "Q3 FY2024",
+    "resultDescription": "Quarterly Results",
+    "audited": "Unaudited",
+    "filingDate": "2024-01-22",
+    "broadCastDate": "2024-01-22",
+    "xbrl": "https://nsearchives.nseindia.com/corporate/xbrl/AXISBANK_Q3FY24.xml"
+  },
+  {
+    "seqNumber": "FR_2024_002",
+    "symbol": "KOTAKBANK",
+    "sm_name": "Kotak Mahindra Bank",
+    "sm_isin": "INE237A01028",
+    "isin": "INE237A01028",
+    "relatingTo": "Q3 FY2024",
+    "resultDescription": "Quarterly Results",
+    "audited": "Audited",
+    "filingDate": "2024-01-20",
+    "broadCastDate": "2024-01-20",
+    "xbrl": "https://nsearchives.nseindia.com/corporate/xbrl/KOTAK_Q3FY24/-"
+  }
+]

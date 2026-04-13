@@ -1,0 +1,35 @@
+<table>
+  <thead>
+    <tr>
+      <th>Date</th>
+      <th>Filing Details</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr role="row">
+      <td>10-Jan-2024</td>
+      <td>
+        <a href="/sebi_data/commondocs/filings/PublicIssues_12345.html">Draft Red Herring Prospectus - XYZ Technologies Ltd</a>
+        <a href="/sebi_data/attachdocs/1706000000000_DRHP_abridged.pdf">Abridged Prospectus</a>
+      </td>
+    </tr>
+    <tr role="row">
+      <td>08-Jan-2024</td>
+      <td>
+        <a href="/sebi_data/commondocs/filings/PublicIssues_12344.html">Offer Document - ABC Pharma Ltd IPO</a>
+      </td>
+    </tr>
+    <tr role="row">
+      <td>05-Jan-2024</td>
+      <td>
+        <a href="https://www.sebi.gov.in/sebi_data/commondocs/filings/PublicIssues_12343.html">DRHP - PQR Fintech Ltd</a>
+        <a href="https://www.sebi.gov.in/sebi_data/attachdocs/companion_file.pdf">Companion PDF</a>
+        <a href="https://www.sebi.gov.in/sebi_data/attachdocs/another_companion.pdf">Another Document</a>
+      </td>
+    </tr>
+  </tbody>
+</table>
+<input type='hidden' name='totalpage' value=3 />
+<input type='hidden' name='currentpage' value=1 />
+#@#
+extradata#@#moredata
