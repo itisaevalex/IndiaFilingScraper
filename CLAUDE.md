@@ -8,7 +8,7 @@ Part of a multi-country financial filings scraper project. Sibling scrapers: Can
 
 ## Current State (2026-04-13)
 
-**Status: WORKING** — All three sources (BSE, NSE, SEBI) are crawling, caching, and downloading.
+**Status: PRODUCTION-READY** — All three sources (BSE, NSE, SEBI) are crawling, caching, and downloading. Code review completed and all HIGH/MEDIUM issues resolved.
 
 **Repo:** https://github.com/itisaevalex/IndiaFilingScraper
 
@@ -111,6 +111,28 @@ None of these require TLS impersonation (unlike SEDAR+ which needed `curl_cffi` 
 - Fix: Added User-Agent + Referer + Origin to SEBI headers
 
 **Lesson for future portals:** Always send a browser User-Agent. It costs nothing and prevents the most common 403/530 blocks. The recon agents testing via WebFetch may have different header behavior than the Python `requests` library.
+
+### Decision 9: Code Review Hardening (Production-Ready)
+
+Code review found 5 HIGH, 7 MEDIUM, 6 LOW issues. All HIGH and MEDIUM fixed:
+
+**Fixed (HIGH):**
+- `try/finally` on all `FilingCache.close()` calls — prevents SQLite WAL corruption on exceptions
+- Per-page error handling in all `_crawl_*` functions — transient 503s skip the page, don't kill the run
+- Download errors logged at WARNING (not DEBUG) with network vs I/O distinction
+- SEBI `has_more` now parses `totalpage` hidden input from response (not heuristic count)
+- Thread-safety invariant documented in download manager
+
+**Fixed (MEDIUM):**
+- Path traversal via `content-disposition` — added `os.path.basename()` defense
+- Proper `urllib3.Retry` with backoff and `status_forcelist=[429,500,502,503,504]`
+- BSE `_build_bse_doc_url` returns empty string on unparseable dates (not wrong URL)
+- SEBI category names precomputed at module load (not linear scan per call)
+- None-safe field extraction for BSE API (fields like `SUBCATNAME` can be JSON null)
+- `.gitignore` now excludes `venv/`, `.venv/`, `*.env`
+- `resolve_sebi_pdf` logs warning on failure (not silent swallow)
+
+**E2E verified after all fixes:** BSE 50 filings, NSE 4,103 filings, SEBI 35 filings, export 4,188 filings, downloads 3/3 PDFs.
 
 ---
 

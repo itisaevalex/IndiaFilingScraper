@@ -192,6 +192,17 @@ Compared to siblings:
 - **Stateless pagination** — BSE allows jumping to any page (SEDAR+ was sequential only)
 - **Direct document URLs** — no encrypted tokens or session-dependent resource paths
 
+### Phase 5: Production Hardening (Code Review)
+
+Automated code review found and fixed 12 issues:
+- **Path traversal defense** — `os.path.basename()` on `content-disposition` filenames
+- **Retry with backoff** — proper `urllib3.Retry` with `status_forcelist=[429,500,502,503,504]`
+- **try/finally on SQLite** — prevents WAL journal corruption on unhandled exceptions
+- **Per-page error handling** — transient 503s skip the page instead of killing the entire crawl
+- **Download error visibility** — failures logged at WARNING (were silently swallowed at DEBUG)
+- **None-safe field extraction** — BSE API returns JSON nulls for optional fields like `SUBCATNAME`
+- **SEBI pagination** — now parses `totalpage` hidden input instead of counting rows heuristically
+
 ## Output
 
 ```

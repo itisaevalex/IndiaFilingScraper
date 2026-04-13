@@ -33,11 +33,11 @@ import sqlite3
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta
-from typing import Any
 from urllib.parse import urlencode
 
 import requests
 from bs4 import BeautifulSoup
+from urllib3.util.retry import Retry
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -103,6 +103,9 @@ SEBI_CATEGORIES = {
     "sm_reit": 98,
 }
 SEBI_PAGE_SIZE = 25
+SEBI_CATEGORY_NAMES: dict[int, str] = {
+    v: k.replace("_", " ").title() for k, v in SEBI_CATEGORIES.items()
+}
 
 logging.basicConfig(
     level=logging.INFO,
@@ -118,10 +121,16 @@ log = logging.getLogger("india-scraper")
 
 
 def create_session() -> requests.Session:
-    """Create a requests session with retry logic."""
+    """Create a requests session with retry and backoff on 5xx errors."""
     s = requests.Session()
+    retry = Retry(
+        total=3,
+        backoff_factor=1.0,
+        status_forcelist=[429, 500, 502, 503, 504],
+        allowed_methods=["GET", "POST"],
+    )
     adapter = requests.adapters.HTTPAdapter(
-        max_retries=3,
+        max_retries=retry,
         pool_connections=10,
         pool_maxsize=10,
     )
@@ -175,22 +184,22 @@ def fetch_bse_page(
 
     filings = []
     for row in table:
-        attachment = row.get("ATTACHMENTNAME", "").strip()
+        attachment = (row.get("ATTACHMENTNAME") or "").strip()
         doc_url = _build_bse_doc_url(row) if attachment else ""
 
         filings.append({
             "source": "bse",
-            "filing_id": str(row.get("NEWSID", "")),
-            "company_name": row.get("SLONGNAME", "").strip(),
-            "symbol": str(row.get("SCRIP_CD", "")).strip(),
+            "filing_id": str(row.get("NEWSID") or ""),
+            "company_name": (row.get("SLONGNAME") or "").strip(),
+            "symbol": str(row.get("SCRIP_CD") or "").strip(),
             "isin": "",
-            "category": row.get("CATEGORYNAME", "").strip(),
-            "subcategory": row.get("SUBCATNAME", "").strip(),
-            "subject": row.get("NEWSSUB", "").strip(),
-            "description": row.get("HEADLINE", "").strip(),
-            "filing_date": row.get("NEWS_DT", "").strip(),
+            "category": (row.get("CATEGORYNAME") or "").strip(),
+            "subcategory": (row.get("SUBCATNAME") or "").strip(),
+            "subject": (row.get("NEWSSUB") or "").strip(),
+            "description": (row.get("HEADLINE") or "").strip(),
+            "filing_date": (row.get("NEWS_DT") or "").strip(),
             "document_url": doc_url,
-            "file_size": str(row.get("Fld_Attachsize", "")),
+            "file_size": str(row.get("Fld_Attachsize") or ""),
             "has_xbrl": False,
             "raw_json": json.dumps(row, ensure_ascii=False),
         })
@@ -215,7 +224,8 @@ def _build_bse_doc_url(row: dict) -> str:
                 f"{dt.year}/{dt.month}/{attachment}"
             )
         except (ValueError, IndexError):
-            return BSE_DOC_BASES.get("1", "") + attachment
+            log.warning("BSE: unparseable date for PDFFLAG=2: %r", news_dt)
+            return ""
 
     base = BSE_DOC_BASES.get(flag, BSE_DOC_BASES["0"])
     return base + attachment
@@ -268,11 +278,11 @@ def fetch_nse_announcements(
             "isin": row.get("sm_isin", "").strip(),
             "category": row.get("desc", "").strip(),
             "subcategory": row.get("smIndustry") or "",
-            "subject": row.get("attchmntText", "").strip()[:500],
+            "subject": row.get("attchmntText", "").strip(),
             "description": row.get("attchmntText", "").strip(),
             "filing_date": row.get("sort_date", "").strip(),
             "document_url": doc_url,
-            "file_size": row.get("fileSize", "").strip(),
+            "file_size": str(row.get("fileSize", "") or ""),
             "has_xbrl": bool(row.get("hasXbrl")),
             "raw_json": json.dumps(row, ensure_ascii=False),
         })
@@ -305,13 +315,18 @@ def fetch_nse_paginated(
             page + 1, from_str, to_str,
         )
 
-        filings = fetch_nse_announcements(
-            session,
-            index_type=index_type,
-            from_date=from_str,
-            to_date=to_str,
-            symbol=symbol,
-        )
+        try:
+            filings = fetch_nse_announcements(
+                session,
+                index_type=index_type,
+                from_date=from_str,
+                to_date=to_str,
+                symbol=symbol,
+            )
+        except (requests.RequestException, ValueError) as e:
+            log.warning("NSE fetch failed for %s to %s: %s — skipping", from_str, to_str, e)
+            end_date = start_date - timedelta(days=1)
+            continue
 
         if not filings:
             log.info("NSE: no filings for %s to %s. Stopping.", from_str, to_str)
@@ -365,10 +380,25 @@ def fetch_sebi_page(
     parts = resp.text.split("#@#")
     html = parts[0] if parts else ""
 
-    return _parse_sebi_html(html, category_id)
+    # Parse pagination info from the hidden inputs in the response
+    has_more = _sebi_has_next_page(html, page_num)
+
+    filings = _parse_sebi_filings(html, category_id)
+    return filings, has_more
 
 
-def _parse_sebi_html(html: str, category_id: int) -> tuple[list[dict], bool]:
+def _sebi_has_next_page(html: str, current_page: int) -> bool:
+    """Determine if SEBI has more pages from the pagination metadata."""
+    # SEBI includes <input type='hidden' name='totalpage' value=N />
+    total_match = re.search(r"name='totalpage'\s+value=(\d+)", html)
+    if total_match:
+        total_pages = int(total_match.group(1))
+        return current_page < total_pages - 1  # 0-indexed
+    # Fallback: check for "Next" link
+    return "javascript: searchFormNewsList('n'" in html
+
+
+def _parse_sebi_filings(html: str, category_id: int) -> list[dict]:
     """Parse SEBI HTML table into filing records.
 
     Each row may have:
@@ -378,7 +408,7 @@ def _parse_sebi_html(html: str, category_id: int) -> tuple[list[dict], bool]:
     """
     soup = BeautifulSoup(html, "lxml")
     filings = []
-    category_name = _sebi_category_name(category_id)
+    category_name = SEBI_CATEGORY_NAMES.get(category_id, f"Category {category_id}")
 
     rows = soup.select("tr[role='row']")
     for tr in rows:
@@ -403,7 +433,7 @@ def _parse_sebi_html(html: str, category_id: int) -> tuple[list[dict], bool]:
         title = re.sub(r"<[^>]+>", "", title).strip()
 
         fid_match = re.search(r"_(\d+)\.html", main_url) or re.search(r"/(\d+)\.\w+$", main_url)
-        filing_id = fid_match.group(1) if fid_match else main_url
+        filing_id = fid_match.group(1) if fid_match else main_url.split("?")[0].rstrip("/")
 
         filings.append({
             "source": "sebi",
@@ -450,8 +480,7 @@ def _parse_sebi_html(html: str, category_id: int) -> tuple[list[dict], bool]:
                 "raw_json": "",
             })
 
-    has_more = len([f for f in filings if f["subcategory"] != "companion"]) >= SEBI_PAGE_SIZE
-    return filings, has_more
+    return filings
 
 
 def resolve_sebi_pdf(session: requests.Session, html_url: str) -> str:
@@ -477,16 +506,9 @@ def resolve_sebi_pdf(session: requests.Session, html_url: str) -> str:
                 return href if href.startswith("http") else f"{SEBI_DOC_BASE}{href}"
 
         return html_url
-    except Exception:
+    except Exception as e:
+        log.warning("SEBI PDF resolution failed for %s: %s", html_url, e)
         return html_url
-
-
-def _sebi_category_name(category_id: int) -> str:
-    """Reverse lookup SEBI category ID to name."""
-    for name, cid in SEBI_CATEGORIES.items():
-        if cid == category_id:
-            return name.replace("_", " ").title()
-    return f"Category {category_id}"
 
 
 # ---------------------------------------------------------------------------
@@ -621,7 +643,12 @@ def download_filings(
     cache: FilingCache,
     parallel: int = 5,
 ) -> int:
-    """Download documents for filings in parallel. Returns count downloaded."""
+    """Download documents for filings in parallel. Returns count downloaded.
+
+    Thread safety: each worker uses the shared session for GET requests (safe
+    with urllib3's connection pooling). All SQLite writes happen on the main
+    thread after workers complete — do not move cache.mark_downloaded into workers.
+    """
     to_download = [f for f in filings if f.get("document_url")]
     if not to_download:
         return 0
@@ -634,48 +661,53 @@ def download_filings(
         source = filing["source"]
         filing_id = filing["filing_id"]
 
+        # SEBI main filings are .html pages with embedded PDFs — resolve first
+        if source == "sebi" and url.endswith(".html"):
+            url = resolve_sebi_pdf(session, url)
+
+        headers = {
+            "User-Agent": (
+                "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+                "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
+            ),
+        }
+
         try:
-            # SEBI main filings are .html pages with embedded PDFs — resolve first
-            if source == "sebi" and url.endswith(".html"):
-                url = resolve_sebi_pdf(session, url)
-
-            headers = {
-                "User-Agent": (
-                    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
-                    "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
-                ),
-            }
-
             resp = session.get(url, headers=headers, timeout=120)
             if resp.status_code != 200:
+                log.warning("Download HTTP %d for %s", resp.status_code, url)
                 return None
+        except requests.RequestException as e:
+            log.warning("Download failed for %s: %s", url, e)
+            return None
 
-            # Determine filename from content-disposition or URL
-            cd = resp.headers.get("content-disposition", "")
-            fname_m = re.search(r'filename="?([^";\n]+)', cd)
-            if fname_m:
-                fname = fname_m.group(1).strip()
-            else:
-                fname = url.split("/")[-1].split("?")[0]
+        # Determine filename — use os.path.basename to prevent path traversal
+        cd = resp.headers.get("content-disposition", "")
+        fname_m = re.search(r'filename="?([^";\n]+)', cd)
+        if fname_m:
+            fname = os.path.basename(fname_m.group(1).strip())
+        else:
+            fname = os.path.basename(url.split("?")[0])
 
-            # Ensure file has an extension
-            if "." not in fname:
-                ct = resp.headers.get("content-type", "")
-                ext = ".pdf" if "pdf" in ct else ".zip" if "zip" in ct else ".bin"
-                fname = fname + ext
+        # Ensure file has an extension
+        if "." not in fname:
+            ct = resp.headers.get("content-type", "")
+            ext = ".pdf" if "pdf" in ct else ".zip" if "zip" in ct else ".bin"
+            fname = fname + ext
 
-            safe_name = re.sub(r'[<>:"/\\|?*]', "_", fname)[:120]
-            prefix = f"{source}_{filing_id}_" if filing_id else f"{source}_"
-            filepath = os.path.join(doc_dir, f"{prefix}{safe_name}")
+        safe_name = re.sub(r'[<>:"/\\|?*]', "_", fname)[:120]
+        prefix = f"{source}_{filing_id}_" if filing_id else f"{source}_"
+        filepath = os.path.join(doc_dir, f"{prefix}{safe_name}")
 
+        try:
             with open(filepath, "wb") as fh:
                 fh.write(resp.content)
-
-            time.sleep(DELAY_BETWEEN_DOWNLOADS)
-            return (source, filing_id, filepath)
-        except Exception as e:
-            log.debug("Download failed for %s: %s", url, e)
+        except OSError as e:
+            log.error("I/O error saving %s: %s", filepath, e)
             return None
+
+        time.sleep(DELAY_BETWEEN_DOWNLOADS)
+        return (source, filing_id, filepath)
 
     if parallel > 1 and len(to_download) > 1:
         with ThreadPoolExecutor(max_workers=min(parallel, len(to_download))) as pool:
@@ -704,47 +736,49 @@ def download_filings(
 def cmd_crawl(args):
     session = create_session()
     cache = FilingCache(args.db)
-    doc_dir = args.doc_dir
-    t_start = time.time()
-    total_filings = 0
-    total_new = 0
-    total_downloaded = 0
+    try:
+        doc_dir = args.doc_dir
+        t_start = time.time()
+        total_filings = 0
+        total_new = 0
+        total_downloaded = 0
 
-    sources = (
-        ["bse", "nse", "sebi"] if args.source == "all"
-        else [args.source]
-    )
+        sources = (
+            ["bse", "nse", "sebi"] if args.source == "all"
+            else [args.source]
+        )
 
-    for source in sources:
-        log.info("=== Crawling %s ===", source.upper())
+        for source in sources:
+            log.info("=== Crawling %s ===", source.upper())
 
-        if source == "bse":
-            total_f, new_f, dl_f = _crawl_bse(
-                session, cache, doc_dir, args.max_pages, args.download, args.parallel,
-            )
-        elif source == "nse":
-            total_f, new_f, dl_f = _crawl_nse(
-                session, cache, doc_dir, args.max_pages, args.download, args.parallel,
-            )
-        elif source == "sebi":
-            total_f, new_f, dl_f = _crawl_sebi(
-                session, cache, doc_dir, args.max_pages, args.download, args.parallel,
-                category=args.sebi_category,
-            )
-        else:
-            log.error("Unknown source: %s", source)
-            continue
+            if source == "bse":
+                total_f, new_f, dl_f = _crawl_bse(
+                    session, cache, doc_dir, args.max_pages, args.download, args.parallel,
+                )
+            elif source == "nse":
+                total_f, new_f, dl_f = _crawl_nse(
+                    session, cache, doc_dir, args.max_pages, args.download, args.parallel,
+                )
+            elif source == "sebi":
+                total_f, new_f, dl_f = _crawl_sebi(
+                    session, cache, doc_dir, args.max_pages, args.download, args.parallel,
+                    category=args.sebi_category,
+                )
+            else:
+                log.error("Unknown source: %s", source)
+                continue
 
-        total_filings += total_f
-        total_new += new_f
-        total_downloaded += dl_f
+            total_filings += total_f
+            total_new += new_f
+            total_downloaded += dl_f
 
-    elapsed = time.time() - t_start
-    log.info(
-        "Done: %d filings (%d new), %d downloaded in %.1fs.",
-        total_filings, total_new, total_downloaded, elapsed,
-    )
-    cache.close()
+        elapsed = time.time() - t_start
+        log.info(
+            "Done: %d filings (%d new), %d downloaded in %.1fs.",
+            total_filings, total_new, total_downloaded, elapsed,
+        )
+    finally:
+        cache.close()
 
 
 def _crawl_bse(
@@ -762,7 +796,11 @@ def _crawl_bse(
         if page_num > 1:
             time.sleep(DELAY_BETWEEN_PAGES)
 
-        filings, total_count = fetch_bse_page(session, page_num=page_num)
+        try:
+            filings, total_count = fetch_bse_page(session, page_num=page_num)
+        except (requests.RequestException, ValueError) as e:
+            log.warning("BSE page %d fetch failed: %s — skipping", page_num, e)
+            continue
 
         if not filings:
             log.info("BSE page %d: no filings. Stopping.", page_num)
@@ -822,13 +860,19 @@ def _crawl_sebi(
     category_id = SEBI_CATEGORIES.get(category, 15)
     total_f = total_new = total_dl = 0
 
+    category_name = SEBI_CATEGORY_NAMES.get(category_id, f"Category {category_id}")
+
     for page_num in range(max_pages):
         if page_num > 0:
             time.sleep(DELAY_BETWEEN_PAGES)
 
-        filings, has_more = fetch_sebi_page(
-            session, page_num=page_num, category_id=category_id,
-        )
+        try:
+            filings, has_more = fetch_sebi_page(
+                session, page_num=page_num, category_id=category_id,
+            )
+        except (requests.RequestException, ValueError) as e:
+            log.warning("SEBI page %d fetch failed: %s — skipping", page_num + 1, e)
+            continue
 
         if not filings:
             log.info("SEBI page %d: no filings. Stopping.", page_num + 1)
@@ -840,7 +884,7 @@ def _crawl_sebi(
 
         log.info(
             "SEBI page %d: %d filings (%d new) [%s]",
-            page_num + 1, len(filings), new, _sebi_category_name(category_id),
+            page_num + 1, len(filings), new, category_name,
         )
 
         if download and filings:
@@ -922,32 +966,34 @@ def cmd_monitor(args):
 
 def cmd_export(args):
     cache = FilingCache(args.db)
-    cache.export_json(args.output, source=args.source if args.source != "all" else "")
-    cache.close()
+    try:
+        cache.export_json(args.output, source=args.source if args.source != "all" else "")
+    finally:
+        cache.close()
 
 
 def cmd_stats(args):
     cache = FilingCache(args.db)
+    try:
+        sources = ["bse", "nse", "sebi"] if args.source == "all" else [args.source]
 
-    sources = ["bse", "nse", "sebi"] if args.source == "all" else [args.source]
+        for source in sources:
+            s = cache.stats(source)
+            print(f"\n--- {source.upper()} ---")
+            print(f"  Total:      {s['total'] or 0}")
+            print(f"  Downloaded: {s['downloaded'] or 0}")
+            print(f"  Pending:    {s['pending'] or 0}")
+            print(f"  Oldest:     {s['oldest'] or 'N/A'}")
+            print(f"  Newest:     {s['newest'] or 'N/A'}")
 
-    for source in sources:
-        s = cache.stats(source)
-        print(f"\n--- {source.upper()} ---")
-        print(f"  Total:      {s['total'] or 0}")
-        print(f"  Downloaded: {s['downloaded'] or 0}")
-        print(f"  Pending:    {s['pending'] or 0}")
-        print(f"  Oldest:     {s['oldest'] or 'N/A'}")
-        print(f"  Newest:     {s['newest'] or 'N/A'}")
-
-    if args.source == "all":
-        s = cache.stats()
-        print(f"\n--- ALL SOURCES ---")
-        print(f"  Total:      {s['total'] or 0}")
-        print(f"  Downloaded: {s['downloaded'] or 0}")
-        print(f"  Pending:    {s['pending'] or 0}")
-
-    cache.close()
+        if args.source == "all":
+            s = cache.stats()
+            print(f"\n--- ALL SOURCES ---")
+            print(f"  Total:      {s['total'] or 0}")
+            print(f"  Downloaded: {s['downloaded'] or 0}")
+            print(f"  Pending:    {s['pending'] or 0}")
+    finally:
+        cache.close()
 
 
 # ---------------------------------------------------------------------------

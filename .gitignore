@@ -11,6 +11,12 @@ filings.json
 documents/
 session.json
 
+# Environment
+venv/
+.venv/
+env/
+*.env
+
 # IDE
 .vscode/
 .idea/
