@@ -1,0 +1,16 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+
+# Data (auto-generated)
+filings_cache.db
+filings.json
+documents/
+session.json
+
+# IDE
+.vscode/
+.idea/
