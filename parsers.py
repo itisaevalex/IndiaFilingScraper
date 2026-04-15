@@ -317,7 +317,12 @@ def parse_bse_response(data: dict) -> tuple[list[dict], int]:
             "ticker": str(row.get("SCRIP_CD") or "").strip(),
             # Keep legacy 'symbol' key for callers that still read it
             "symbol": str(row.get("SCRIP_CD") or "").strip(),
-            "isin": "",
+            # BSE API does not include ISIN in announcement responses.
+            # The scrip code (SCRIP_CD) is the BSE-specific numeric identifier.
+            # ISIN lookup requires a separate BSE company master API call.
+            "isin": None,
+            "lei": None,
+            "language": "en",
             "category": (row.get("CATEGORYNAME") or "").strip(),
             "subcategory": (row.get("SUBCATNAME") or "").strip(),
             "subject": (row.get("NEWSSUB") or "").strip(),
@@ -367,7 +372,10 @@ def _normalize_nse_record(row: dict, endpoint_type: str) -> Optional[dict]:
             "company_name": company,
             "ticker": symbol,
             "symbol": symbol,
-            "isin": isin,
+            # NSE provides ISIN natively via sm_isin field (ISO 6166)
+            "isin": isin or None,
+            "lei": None,
+            "language": "en",
             "category": (row.get("desc") or "").strip(),
             "subcategory": row.get("smIndustry") or "",
             "subject": headline,
@@ -396,7 +404,10 @@ def _normalize_nse_record(row: dict, endpoint_type: str) -> Optional[dict]:
             "company_name": company,
             "ticker": symbol,
             "symbol": symbol,
-            "isin": isin,
+            # NSE provides ISIN natively (sm_isin or isin field)
+            "isin": isin or None,
+            "lei": None,
+            "language": "en",
             "category": "Annual Report",
             "subcategory": f"{from_yr}-{to_yr}",
             "subject": headline,
@@ -419,13 +430,17 @@ def _normalize_nse_record(row: dict, endpoint_type: str) -> Optional[dict]:
         bm_symbol = (row.get("bm_symbol") or symbol).strip()
         raw_date = (row.get("bm_timestamp") or row.get("bm_date") or "").strip()
         headline = (row.get("bm_purpose") or "").strip()
+        bm_isin = (row.get("sm_isin") or isin or "").strip()
         return {
             "source": "nse",
             "filing_id": f"bm_{bm_symbol}_{row.get('bm_timestamp', '')}",
             "company_name": (row.get("sm_name") or company).strip(),
             "ticker": bm_symbol,
             "symbol": bm_symbol,
-            "isin": (row.get("sm_isin") or isin).strip(),
+            # NSE provides ISIN natively via sm_isin field
+            "isin": bm_isin or None,
+            "lei": None,
+            "language": "en",
             "category": "Board Meeting",
             "subcategory": headline,
             "subject": headline,
@@ -449,13 +464,18 @@ def _normalize_nse_record(row: dict, endpoint_type: str) -> Optional[dict]:
         headline = (
             f"{row.get('relatingTo', '')} Results - {company} ({row.get('audited', '')})"
         )
+        # financial_results has both sm_isin and isin fields in the API response
+        fr_isin = ((row.get("isin") or isin or "")).strip()
         return {
             "source": "nse",
             "filing_id": f"fr_{row.get('seqNumber', '')}",
             "company_name": company,
             "ticker": symbol,
             "symbol": symbol,
-            "isin": (row.get("isin") or isin).strip(),
+            # NSE provides ISIN natively via both sm_isin and isin fields
+            "isin": fr_isin or None,
+            "lei": None,
+            "language": "en",
             "category": "Financial Results",
             "subcategory": (row.get("relatingTo") or "").strip(),
             "subject": headline,
@@ -632,7 +652,13 @@ def _parse_sebi_html(html: str, category_id: int) -> list[dict]:
             "company_name": title,
             "ticker": "",
             "symbol": "",
-            "isin": "",
+            # SEBI regulatory filings do not include ISIN in the listing response.
+            # These are offer-level documents (IPOs, takeovers, buybacks) rather
+            # than per-company disclosures, so ISIN lookup would require matching
+            # the filing to a company in a separate master dataset.
+            "isin": None,
+            "lei": None,
+            "language": "en",
             "category": category_name,
             "subcategory": "",
             "subject": title,
@@ -674,7 +700,9 @@ def _parse_sebi_html(html: str, category_id: int) -> list[dict]:
                 "company_name": title,
                 "ticker": "",
                 "symbol": "",
-                "isin": "",
+                "isin": None,
+                "lei": None,
+                "language": "en",
                 "category": category_name,
                 "subcategory": "companion",
                 "subject": extra_title or f"{title} - Companion",

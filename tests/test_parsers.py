@@ -215,13 +215,13 @@ class TestParseBseResponse:
         assert total == 1250
 
     def test_filing_schema_completeness(self, bse_response_data):
-        """Every parsed filing has all required schema fields (L3 spec)."""
+        """Every parsed filing has all required schema fields (L3 spec + isin/lei/language)."""
         filings, _ = parse_bse_response(bse_response_data)
         required = {
             "source", "filing_id", "company_name", "ticker", "symbol",
             "category", "subject", "headline", "filing_date", "filing_time",
             "document_url", "direct_download_url", "file_size", "raw_metadata",
-            "country",
+            "country", "isin", "lei", "language",
         }
         for f in filings:
             assert required.issubset(f.keys()), f"Missing keys: {required - f.keys()}"
@@ -563,3 +563,118 @@ class TestClassifyFilingType:
     def test_sebi_public_issue_subject(self):
         """SEBI public issue title maps to IPO / Rights Issue."""
         assert classify_filing_type("Draft Red Herring Prospectus - XYZ Technologies Ltd") == "IPO / Rights Issue"
+
+
+# ===========================================================================
+# isin / lei / language field tests (spec v1.x)
+# ===========================================================================
+
+
+class TestIsinLeiLanguageInParsers:
+    """Tests that isin, lei, and language fields are correctly set by all parsers."""
+
+    # ---- BSE ----
+
+    def test_bse_isin_is_none(self, bse_response_data):
+        """BSE parser sets isin=None (BSE API does not include ISIN natively)."""
+        filings, _ = parse_bse_response(bse_response_data)
+        for f in filings:
+            assert f["isin"] is None, (
+                f"BSE filing {f['filing_id']} should have isin=None, got {f['isin']!r}"
+            )
+
+    def test_bse_lei_is_none(self, bse_response_data):
+        """BSE parser sets lei=None."""
+        filings, _ = parse_bse_response(bse_response_data)
+        for f in filings:
+            assert f["lei"] is None
+
+    def test_bse_language_is_en(self, bse_response_data):
+        """BSE parser sets language='en' for all filings."""
+        filings, _ = parse_bse_response(bse_response_data)
+        for f in filings:
+            assert f["language"] == "en", (
+                f"BSE filing {f['filing_id']} should have language='en', got {f['language']!r}"
+            )
+
+    # ---- NSE announcements ----
+
+    def test_nse_announcements_isin_populated(self, nse_announcements_data):
+        """NSE announcements parser extracts ISIN from sm_isin field."""
+        filings = parse_nse_response(nse_announcements_data, "announcements")
+        reliance = next(f for f in filings if f["symbol"] == "RELIANCE")
+        assert reliance["isin"] == "INE002A01018"
+
+    def test_nse_announcements_isin_format_indian(self, nse_announcements_data):
+        """NSE ISIN values follow Indian ISIN format: INE + 9 chars."""
+        filings = parse_nse_response(nse_announcements_data, "announcements")
+        for f in filings:
+            if f["isin"]:
+                assert f["isin"].startswith("INE"), (
+                    f"Expected Indian ISIN (INE...) for NSE filing, got {f['isin']!r}"
+                )
+                assert len(f["isin"]) == 12, (
+                    f"ISIN should be 12 chars (ISO 6166), got {len(f['isin'])} for {f['isin']!r}"
+                )
+
+    def test_nse_announcements_language_is_en(self, nse_announcements_data):
+        """NSE announcements parser sets language='en'."""
+        filings = parse_nse_response(nse_announcements_data, "announcements")
+        for f in filings:
+            assert f["language"] == "en"
+
+    def test_nse_announcements_lei_is_none(self, nse_announcements_data):
+        """NSE announcements parser sets lei=None."""
+        filings = parse_nse_response(nse_announcements_data, "announcements")
+        for f in filings:
+            assert f["lei"] is None
+
+    # ---- NSE board meetings ----
+
+    def test_nse_board_meetings_isin_from_sm_isin(self, nse_board_meetings_data):
+        """NSE board_meetings parser extracts ISIN from sm_isin field."""
+        filings = parse_nse_response(nse_board_meetings_data, "board_meetings")
+        assert filings[0]["isin"] == "INE040A01034"
+
+    def test_nse_board_meetings_language_is_en(self, nse_board_meetings_data):
+        """NSE board_meetings parser sets language='en'."""
+        filings = parse_nse_response(nse_board_meetings_data, "board_meetings")
+        assert filings[0]["language"] == "en"
+
+    # ---- NSE financial results ----
+
+    def test_nse_financial_results_isin_populated(self, nse_financial_results_data):
+        """NSE financial_results parser extracts ISIN from isin/sm_isin fields."""
+        filings = parse_nse_response(nse_financial_results_data, "financial_results")
+        axisbank = next(f for f in filings if f["symbol"] == "AXISBANK")
+        assert axisbank["isin"] == "INE238A01034"
+
+    def test_nse_financial_results_language_is_en(self, nse_financial_results_data):
+        """NSE financial_results parser sets language='en'."""
+        filings = parse_nse_response(nse_financial_results_data, "financial_results")
+        for f in filings:
+            assert f["language"] == "en"
+
+    # ---- SEBI ----
+
+    def test_sebi_isin_is_none(self, sebi_response_text):
+        """SEBI parser sets isin=None (regulatory filings lack per-security ISIN)."""
+        filings, _ = parse_sebi_page(sebi_response_text, category_id=15, current_page=0)
+        for f in filings:
+            assert f["isin"] is None, (
+                f"SEBI filing {f['filing_id']} should have isin=None, got {f['isin']!r}"
+            )
+
+    def test_sebi_lei_is_none(self, sebi_response_text):
+        """SEBI parser sets lei=None."""
+        filings, _ = parse_sebi_page(sebi_response_text, category_id=15, current_page=0)
+        for f in filings:
+            assert f["lei"] is None
+
+    def test_sebi_language_is_en(self, sebi_response_text):
+        """SEBI parser sets language='en' for all filings including companions."""
+        filings, _ = parse_sebi_page(sebi_response_text, category_id=15, current_page=0)
+        for f in filings:
+            assert f["language"] == "en", (
+                f"SEBI filing {f['filing_id']} should have language='en', got {f['language']!r}"
+            )

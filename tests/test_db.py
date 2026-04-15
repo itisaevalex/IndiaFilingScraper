@@ -67,7 +67,7 @@ class TestSchemaCreation:
         assert col_map["filing_id"][5] == 1, "filing_id should be PRIMARY KEY"
 
     def test_l3_columns_present(self, tmp_db):
-        """All required L3 spec columns are present."""
+        """All required L3 spec columns are present (including isin, lei, language)."""
         info = tmp_db.conn.execute("PRAGMA table_info(filings)").fetchall()
         col_names = {row[1] for row in info}
         required = {
@@ -76,15 +76,20 @@ class TestSchemaCreation:
             "document_url", "direct_download_url", "file_size", "num_pages",
             "price_sensitive", "downloaded", "download_path", "raw_metadata",
             "created_at",
+            "isin", "lei", "language",
         }
         missing = required - col_names
         assert not missing, f"Missing L3 columns: {missing}"
 
     def test_no_l2_specific_columns(self, tmp_db):
-        """L2-specific columns (symbol, isin, raw_json, local_path) are absent."""
+        """L2-specific columns (symbol, raw_json, local_path, etc.) are absent.
+
+        Note: isin is now an L3 spec column (added in spec v1.x), so it is
+        expected to be present and is NOT in this exclusion set.
+        """
         info = tmp_db.conn.execute("PRAGMA table_info(filings)").fetchall()
         col_names = {row[1] for row in info}
-        l2_only = {"symbol", "isin", "raw_json", "local_path", "first_seen",
+        l2_only = {"symbol", "raw_json", "local_path", "first_seen",
                    "subcategory", "subject", "description", "has_xbrl", "page_number"}
         present = l2_only & col_names
         assert not present, f"L2-only columns still present: {present}"
@@ -740,3 +745,124 @@ class TestCrawlLog:
         tmp_db.save_crawl_state("bse", "last_page", "3")
         tmp_db.save_crawl_state("nse", "last_date_announcements", "01-01-2024")
         assert tmp_db.total_crawl_runs() == 2
+
+
+# ===========================================================================
+# isin / lei / language fields (spec v1.x)
+# ===========================================================================
+
+
+class TestIsinLeiLanguageFields:
+    """Tests for isin, lei, and language columns added in spec v1.x."""
+
+    def test_isin_lei_language_columns_present(self, tmp_db):
+        """The filings table has isin, lei, and language columns."""
+        info = tmp_db.conn.execute("PRAGMA table_info(filings)").fetchall()
+        col_names = {row[1] for row in info}
+        assert "isin" in col_names, "isin column missing"
+        assert "lei" in col_names, "lei column missing"
+        assert "language" in col_names, "language column missing"
+
+    def test_isin_index_exists(self, tmp_db):
+        """idx_filings_isin index is created on the isin column."""
+        rows = tmp_db.conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='index' AND name='idx_filings_isin'"
+        ).fetchone()
+        assert rows is not None, "idx_filings_isin index missing"
+
+    def test_language_default_en_for_bse(self, tmp_db, sample_bse_filing):
+        """BSE filings are stored with language='en'."""
+        tmp_db.insert_batch([sample_bse_filing])
+        l3_fid = "bse_TEST_BSE_001"
+        row = tmp_db.conn.execute(
+            "SELECT language FROM filings WHERE filing_id=?", (l3_fid,)
+        ).fetchone()
+        assert row[0] == "en"
+
+    def test_language_default_en_for_nse(self, tmp_db, sample_nse_filing):
+        """NSE filings are stored with language='en'."""
+        tmp_db.insert_batch([sample_nse_filing])
+        l3_fid = "nse_TEST_NSE_001"
+        row = tmp_db.conn.execute(
+            "SELECT language FROM filings WHERE filing_id=?", (l3_fid,)
+        ).fetchone()
+        assert row[0] == "en"
+
+    def test_language_default_en_for_sebi(self, tmp_db, sample_sebi_filing):
+        """SEBI filings are stored with language='en'."""
+        tmp_db.insert_batch([sample_sebi_filing])
+        l3_fid = "sebi_12345"
+        row = tmp_db.conn.execute(
+            "SELECT language FROM filings WHERE filing_id=?", (l3_fid,)
+        ).fetchone()
+        assert row[0] == "en"
+
+    def test_isin_stored_for_nse_filing(self, tmp_db, sample_nse_filing):
+        """NSE filings with an ISIN have it persisted to the database."""
+        tmp_db.insert_batch([sample_nse_filing])
+        l3_fid = "nse_TEST_NSE_001"
+        row = tmp_db.conn.execute(
+            "SELECT isin FROM filings WHERE filing_id=?", (l3_fid,)
+        ).fetchone()
+        assert row[0] == "INE123456789"
+
+    def test_isin_null_for_bse_filing(self, tmp_db, sample_bse_filing):
+        """BSE filings have isin=NULL (BSE API does not expose ISIN natively)."""
+        tmp_db.insert_batch([sample_bse_filing])
+        l3_fid = "bse_TEST_BSE_001"
+        row = tmp_db.conn.execute(
+            "SELECT isin FROM filings WHERE filing_id=?", (l3_fid,)
+        ).fetchone()
+        assert row[0] is None
+
+    def test_isin_null_for_sebi_filing(self, tmp_db, sample_sebi_filing):
+        """SEBI filings have isin=NULL (regulatory filings lack per-company ISIN)."""
+        tmp_db.insert_batch([sample_sebi_filing])
+        l3_fid = "sebi_12345"
+        row = tmp_db.conn.execute(
+            "SELECT isin FROM filings WHERE filing_id=?", (l3_fid,)
+        ).fetchone()
+        assert row[0] is None
+
+    def test_lei_null_by_default(self, tmp_db, sample_nse_filing):
+        """lei is NULL by default — no source provides LEI natively yet."""
+        tmp_db.insert_batch([sample_nse_filing])
+        l3_fid = "nse_TEST_NSE_001"
+        row = tmp_db.conn.execute(
+            "SELECT lei FROM filings WHERE filing_id=?", (l3_fid,)
+        ).fetchone()
+        assert row[0] is None
+
+    def test_isin_empty_string_stored_as_null(self, tmp_db):
+        """Empty string isin is normalised to NULL, not stored as empty string."""
+        filing = {
+            "source": "bse",
+            "filing_id": "ISIN_TEST_001",
+            "company_name": "ISIN Test Co",
+            "isin": "",
+            "filing_date": "2024-01-01",
+        }
+        tmp_db.insert_batch([filing])
+        l3_fid = "bse_ISIN_TEST_001"
+        row = tmp_db.conn.execute(
+            "SELECT isin FROM filings WHERE filing_id=?", (l3_fid,)
+        ).fetchone()
+        assert row[0] is None
+
+    def test_additive_migration_idempotent(self, tmp_db):
+        """Running _apply_additive_migrations twice does not raise or duplicate columns."""
+        from db import _apply_additive_migrations
+        _apply_additive_migrations(tmp_db.conn)  # second call
+        info = tmp_db.conn.execute("PRAGMA table_info(filings)").fetchall()
+        col_names = [row[1] for row in info]
+        # No duplicate column names
+        assert len(col_names) == len(set(col_names))
+
+    def test_isin_index_queryable(self, tmp_db, sample_nse_filing):
+        """Can query filings by ISIN using the idx_filings_isin index."""
+        tmp_db.insert_batch([sample_nse_filing])
+        rows = tmp_db.conn.execute(
+            "SELECT filing_id FROM filings WHERE isin=?", ("INE123456789",)
+        ).fetchall()
+        assert len(rows) == 1
+        assert rows[0][0] == "nse_TEST_NSE_001"

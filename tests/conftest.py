@@ -98,14 +98,21 @@ def tmp_db():
 
 @pytest.fixture
 def sample_bse_filing() -> dict:
-    """A minimal valid BSE filing dict (L3 spec — ISO date)."""
+    """A minimal valid BSE filing dict (L3 spec — ISO date).
+
+    isin is None: BSE announcement API does not include ISIN natively.
+    BSE uses numeric scrip codes (SCRIP_CD). ISIN would require a separate
+    lookup via the BSE company master endpoint.
+    """
     return {
         "source": "bse",
         "filing_id": "TEST_BSE_001",
         "company_name": "Test Corp",
         "ticker": "TESTCORP",
         "symbol": "TESTCORP",
-        "isin": "",
+        "isin": None,
+        "lei": None,
+        "language": "en",
         "category": "Board Meeting",
         "subcategory": "",
         "headline": "Board Meeting Notice",
@@ -125,7 +132,12 @@ def sample_bse_filing() -> dict:
 
 @pytest.fixture
 def sample_nse_filing() -> dict:
-    """A minimal valid NSE filing dict (L3 spec — ISO date)."""
+    """A minimal valid NSE filing dict (L3 spec — ISO date).
+
+    isin is set: NSE provides ISIN natively via the sm_isin field in all
+    announcement and financial result API responses (ISO 6166 format,
+    e.g. INE + 9 chars).
+    """
     return {
         "source": "nse",
         "filing_id": "TEST_NSE_001",
@@ -133,6 +145,8 @@ def sample_nse_filing() -> dict:
         "ticker": "NSETEST",
         "symbol": "NSETEST",
         "isin": "INE123456789",
+        "lei": None,
+        "language": "en",
         "category": "Financial Results",
         "subcategory": "IT",
         "headline": "Q3 Financial Results",
@@ -152,14 +166,22 @@ def sample_nse_filing() -> dict:
 
 @pytest.fixture
 def sample_sebi_filing() -> dict:
-    """A minimal valid SEBI filing dict (L3 spec — ISO date)."""
+    """A minimal valid SEBI filing dict (L3 spec — ISO date).
+
+    isin is None: SEBI regulatory filings (IPOs, takeovers, buybacks) are
+    offer-level documents and do not carry a per-security ISIN in the
+    getnewslistinfo.jsp response. ISIN lookup would require a separate
+    mapping to SEBI's company master.
+    """
     return {
         "source": "sebi",
         "filing_id": "12345",
         "company_name": "SEBI Test Corp IPO",
         "ticker": "",
         "symbol": "",
-        "isin": "",
+        "isin": None,
+        "lei": None,
+        "language": "en",
         "category": "Public Issues",
         "subcategory": "",
         "headline": "Draft Red Herring Prospectus",

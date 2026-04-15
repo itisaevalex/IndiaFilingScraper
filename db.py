@@ -42,6 +42,9 @@ class Filing:
     raw_metadata: str = ""
     created_at: str = ""
     country: str = "IN"
+    isin: str | None = None      # ISO 6166 — NSE provides natively; BSE/SEBI need lookup
+    lei: str | None = None       # ISO 17442 Legal Entity Identifier (20-char)
+    language: str = "en"         # ISO 639-1 — all Indian sources publish in English
 
     def to_dict(self) -> dict:
         """Return a plain dict suitable for DB insertion."""
@@ -65,6 +68,9 @@ class Filing:
             "download_path": self.download_path,
             "raw_metadata": self.raw_metadata,
             "created_at": self.created_at,
+            "isin": self.isin,
+            "lei": self.lei,
+            "language": self.language,
         }
 
     @classmethod
@@ -90,6 +96,9 @@ class Filing:
             download_path=d.get("download_path", ""),
             raw_metadata=d.get("raw_metadata", ""),
             created_at=d.get("created_at", ""),
+            isin=d.get("isin") or None,
+            lei=d.get("lei") or None,
+            language=d.get("language") or "en",
         )
 
 
@@ -117,13 +126,17 @@ CREATE TABLE IF NOT EXISTS filings (
     downloaded BOOLEAN DEFAULT FALSE,
     download_path TEXT,
     raw_metadata TEXT,
-    created_at TEXT
+    created_at TEXT,
+    isin TEXT,
+    lei TEXT,
+    language TEXT DEFAULT 'en'
 );
 CREATE INDEX IF NOT EXISTS idx_source ON filings(source);
 CREATE INDEX IF NOT EXISTS idx_doc_url ON filings(document_url);
 CREATE INDEX IF NOT EXISTS idx_dl ON filings(downloaded);
 CREATE INDEX IF NOT EXISTS idx_date ON filings(filing_date);
 CREATE INDEX IF NOT EXISTS idx_type ON filings(filing_type);
+CREATE INDEX IF NOT EXISTS idx_filings_isin ON filings(isin);
 
 CREATE TABLE IF NOT EXISTS crawl_state (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -156,8 +169,8 @@ INSERT OR IGNORE INTO filings
    (filing_id, source, country, ticker, company_name, filing_date, filing_time,
     headline, filing_type, category, document_url, direct_download_url,
     file_size, num_pages, price_sensitive, downloaded, download_path,
-    raw_metadata, created_at)
-VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+    raw_metadata, created_at, isin, lei, language)
+VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
 """
 
 # ---------------------------------------------------------------------------
@@ -259,6 +272,10 @@ def _migrate_l2_to_l3(conn: sqlite3.Connection) -> None:
         ticker = str(d.get("symbol", "") or "").strip()
         raw_metadata = d.get("raw_json", "") or ""
 
+        # Carry over any ISIN that existed in the L2 schema (isin column was
+        # present in _L2_COLUMNS); normalise empty string to None.
+        isin_val = str(d.get("isin", "") or "").strip() or None
+
         conn.execute(
             _INSERT_SQL,
             (
@@ -281,12 +298,55 @@ def _migrate_l2_to_l3(conn: sqlite3.Connection) -> None:
                 str(d.get("local_path", "") or ""),
                 raw_metadata,
                 str(d.get("first_seen", "") or datetime.now().isoformat()),
+                isin_val,
+                None,   # lei — not present in L2
+                "en",   # language — all Indian sources are English
             ),
         )
         migrated += 1
 
     conn.commit()
     log.info("db: migration complete — %d rows migrated", migrated)
+
+
+def _apply_additive_migrations(conn: sqlite3.Connection) -> None:
+    """Apply additive (non-breaking) ALTER TABLE migrations to an L3 schema.
+
+    Adds columns that were introduced after the initial L3 spec without
+    requiring a full table rebuild.  Each ALTER TABLE is guarded by a column
+    presence check so the function is safe to call on every startup.
+
+    Currently handles:
+      - isin TEXT           (ISO 6166 ISIN, spec v1.x)
+      - lei TEXT            (ISO 17442 LEI, spec v1.x)
+      - language TEXT       (ISO 639-1 language code, spec v1.x)
+      - idx_filings_isin    (index on isin column)
+    """
+    cols = _get_table_columns(conn, "filings")
+
+    # If the table doesn't exist yet, _SCHEMA will create it with all columns.
+    if not cols:
+        return
+
+    if "isin" not in cols:
+        conn.execute("ALTER TABLE filings ADD COLUMN isin TEXT")
+        log.info("db: added column isin to filings")
+
+    if "lei" not in cols:
+        conn.execute("ALTER TABLE filings ADD COLUMN lei TEXT")
+        log.info("db: added column lei to filings")
+
+    if "language" not in cols:
+        conn.execute("ALTER TABLE filings ADD COLUMN language TEXT DEFAULT 'en'")
+        log.info("db: added column language to filings")
+
+    conn.commit()
+
+    # Add index if it does not exist yet (CREATE INDEX IF NOT EXISTS is idempotent)
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_filings_isin ON filings(isin)"
+    )
+    conn.commit()
 
 
 def _needs_migration(conn: sqlite3.Connection) -> bool:
@@ -316,8 +376,18 @@ class FilingCache:
         if _needs_migration(self.conn):
             _migrate_l2_to_l3(self.conn)
         else:
+            # Additive migrations must run before executescript(_SCHEMA) so that
+            # CREATE INDEX IF NOT EXISTS idx_filings_isin sees the isin column
+            # on existing L3 databases that predate spec v1.x column additions.
+            # On fresh databases the filings table doesn't exist yet, so the
+            # additive migration is a no-op, then _SCHEMA creates everything.
+            _apply_additive_migrations(self.conn)
             self.conn.executescript(_SCHEMA)
             self.conn.commit()
+            return
+
+        # Always run additive migrations so existing L3 DBs gain new columns.
+        _apply_additive_migrations(self.conn)
 
     # ------------------------------------------------------------------
     # Write operations
@@ -366,6 +436,15 @@ class FilingCache:
             # raw_metadata: prefer 'raw_metadata', fall back to 'raw_json'
             raw_metadata = f.get("raw_metadata", "") or f.get("raw_json", "") or ""
 
+            # ISIN: use explicit 'isin' field; empty string normalised to None
+            isin_val = f.get("isin") or None
+
+            # LEI: not yet extracted from any source — defaults to None
+            lei_val = f.get("lei") or None
+
+            # language: all Indian sources publish in English
+            language_val = f.get("language") or "en"
+
             self.conn.execute(
                 _INSERT_SQL,
                 (
@@ -388,6 +467,9 @@ class FilingCache:
                     f.get("download_path", "") or f.get("local_path", ""),
                     raw_metadata,
                     datetime.now().isoformat(),
+                    isin_val,
+                    lei_val,
+                    language_val,
                 ),
             )
         self.conn.commit()
