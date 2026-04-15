@@ -34,6 +34,14 @@ from parsers import (
     SEBI_DOC_BASE,
 )
 
+# Fixture scrip codes present in tests/fixtures/bse_response.json
+_BSE_ISIN_MAP: dict[str, str] = {
+    "500325": "INE002A01018",   # Reliance
+    "532540": "INE467B01029",   # TCS
+    "500209": "INE009A01021",   # Infosys
+    # 500180 (HDFC) intentionally omitted to test missing-code fallback
+}
+
 
 # ===========================================================================
 # Date normalization tests (L3 requirement)
@@ -678,3 +686,143 @@ class TestIsinLeiLanguageInParsers:
             assert f["language"] == "en", (
                 f"SEBI filing {f['filing_id']} should have language='en', got {f['language']!r}"
             )
+
+    # ---- BSE ISIN map lookup ----
+
+    def test_bse_isin_populated_from_map(self, bse_response_data):
+        """parse_bse_response populates isin when bse_isin_map covers the scrip code."""
+        filings, _ = parse_bse_response(bse_response_data, bse_isin_map=_BSE_ISIN_MAP)
+        ril = next(f for f in filings if f["symbol"] == "500325")
+        assert ril["isin"] == "INE002A01018"
+
+    def test_bse_isin_all_mapped_codes_resolved(self, bse_response_data):
+        """All scrip codes present in bse_isin_map are resolved correctly."""
+        filings, _ = parse_bse_response(bse_response_data, bse_isin_map=_BSE_ISIN_MAP)
+        code_to_isin = {f["symbol"]: f["isin"] for f in filings}
+        assert code_to_isin["500325"] == "INE002A01018"
+        assert code_to_isin["532540"] == "INE467B01029"
+        assert code_to_isin["500209"] == "INE009A01021"
+
+    def test_bse_isin_none_for_missing_scrip_in_map(self, bse_response_data):
+        """parse_bse_response sets isin=None when scrip code is absent from the map."""
+        filings, _ = parse_bse_response(bse_response_data, bse_isin_map=_BSE_ISIN_MAP)
+        # 500180 (HDFC) was intentionally omitted from _BSE_ISIN_MAP
+        hdfc = next(f for f in filings if f["symbol"] == "500180")
+        assert hdfc["isin"] is None
+
+    def test_bse_isin_none_when_no_map_passed(self, bse_response_data):
+        """parse_bse_response keeps isin=None when bse_isin_map is not provided."""
+        filings, _ = parse_bse_response(bse_response_data)
+        for f in filings:
+            assert f["isin"] is None
+
+    def test_bse_isin_none_when_empty_map_passed(self, bse_response_data):
+        """parse_bse_response gives isin=None for all filings when map is empty."""
+        filings, _ = parse_bse_response(bse_response_data, bse_isin_map={})
+        for f in filings:
+            assert f["isin"] is None
+
+
+# ===========================================================================
+# fetch_bse_isin_map tests (scraper-level helper)
+# ===========================================================================
+
+
+class TestFetchBseIsinMap:
+    """Unit tests for scraper.fetch_bse_isin_map()."""
+
+    def _make_mock_session(self, payload: object, status_code: int = 200) -> "requests.Session":
+        """Return a mock session whose .get() returns the given payload."""
+        import requests
+        from unittest.mock import MagicMock
+
+        mock_resp = MagicMock()
+        mock_resp.status_code = status_code
+        if status_code != 200:
+            mock_resp.raise_for_status.side_effect = requests.HTTPError(
+                response=mock_resp
+            )
+        else:
+            mock_resp.raise_for_status.return_value = None
+            mock_resp.json.return_value = payload
+
+        mock_session = MagicMock(spec=requests.Session)
+        mock_session.get.return_value = mock_resp
+        return mock_session
+
+    def test_returns_dict_from_bare_list_response(self):
+        """Builds the map correctly when the API returns a bare JSON array."""
+        import sys
+        sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
+        from scraper import fetch_bse_isin_map
+
+        payload = [
+            {"SCRIP_CD": "500325", "ISIN_NUMBER": "INE002A01018"},
+            {"SCRIP_CD": "532540", "ISIN_NUMBER": "INE467B01029"},
+        ]
+        session = self._make_mock_session(payload)
+        result = fetch_bse_isin_map(session)
+        assert result == {"500325": "INE002A01018", "532540": "INE467B01029"}
+
+    def test_returns_dict_from_table_wrapped_response(self):
+        """Builds the map when the API wraps the list under a 'Table' key."""
+        import sys
+        sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
+        from scraper import fetch_bse_isin_map
+
+        payload = {
+            "Table": [{"SCRIP_CD": "500209", "ISIN_NUMBER": "INE009A01021"}],
+            "Table1": [],
+        }
+        session = self._make_mock_session(payload)
+        result = fetch_bse_isin_map(session)
+        assert result == {"500209": "INE009A01021"}
+
+    def test_returns_empty_dict_on_http_error(self):
+        """Returns {} without raising when the HTTP request fails."""
+        import sys
+        sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
+        from scraper import fetch_bse_isin_map
+
+        session = self._make_mock_session({}, status_code=503)
+        result = fetch_bse_isin_map(session)
+        assert result == {}
+
+    def test_returns_empty_dict_on_network_error(self):
+        """Returns {} without raising on connection error."""
+        import requests
+        import sys
+        from unittest.mock import MagicMock
+        sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
+        from scraper import fetch_bse_isin_map
+
+        mock_session = MagicMock(spec=requests.Session)
+        mock_session.get.side_effect = requests.ConnectionError("network down")
+        result = fetch_bse_isin_map(mock_session)
+        assert result == {}
+
+    def test_returns_empty_dict_on_unexpected_response_shape(self):
+        """Returns {} when the response is not a list or dict with known key."""
+        import sys
+        sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
+        from scraper import fetch_bse_isin_map
+
+        session = self._make_mock_session("unexpected string")
+        result = fetch_bse_isin_map(session)
+        assert result == {}
+
+    def test_skips_rows_without_scrip_or_isin(self):
+        """Rows missing SCRIP_CD or ISIN_NUMBER are silently skipped."""
+        import sys
+        sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
+        from scraper import fetch_bse_isin_map
+
+        payload = [
+            {"SCRIP_CD": "500325", "ISIN_NUMBER": "INE002A01018"},
+            {"SCRIP_CD": "",       "ISIN_NUMBER": "INE000000000"},  # blank scrip
+            {"SCRIP_CD": "999999", "ISIN_NUMBER": ""},              # blank isin
+            {},                                                       # no keys at all
+        ]
+        session = self._make_mock_session(payload)
+        result = fetch_bse_isin_map(session)
+        assert result == {"500325": "INE002A01018"}

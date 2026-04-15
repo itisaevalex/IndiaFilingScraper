@@ -60,6 +60,10 @@ EXIT_FATAL = 3    # Fatal error (DB inaccessible, bad config, etc.)
 
 BSE_API_BASE = "https://api.bseindia.com/BseIndiaAPI/api"
 BSE_ANNOUNCEMENTS_URL = f"{BSE_API_BASE}/AnnSubCategoryGetData/w"
+BSE_ISIN_LIST_URL = (
+    f"{BSE_API_BASE}/ListofScripData/w"
+    "?Group=&Scripcode=&industry=&segment=Equity&status=Active"
+)
 BSE_PAGE_SIZE = 50
 
 NSE_API_BASE = "https://www.nseindia.com/api"
@@ -99,6 +103,61 @@ def _configure_logging(log_file: str | None = None) -> None:
 
 
 # ---------------------------------------------------------------------------
+# BSE ISIN lookup (one bulk call at startup)
+# ---------------------------------------------------------------------------
+
+
+def fetch_bse_isin_map(session: requests.Session) -> dict[str, str]:
+    """Download the BSE active equity list and build a scrip-code → ISIN map.
+
+    Makes a single HTTP GET to the BSE bulk equity list endpoint, which returns
+    ~5 000 active equities with their ISIN numbers.  The result is used by
+    ``fetch_bse_page`` to populate the ``isin`` field on each BSE filing.
+
+    On any network or parse failure the function logs a WARNING and returns an
+    empty dict, allowing the crawl to continue with ``isin=None`` per filing
+    (backward-compatible behaviour).
+
+    Args:
+        session: Requests session with BSE headers and retry logic.
+
+    Returns:
+        ``{scrip_code: isin}`` mapping, or ``{}`` on failure.
+    """
+    try:
+        resp = session.get(BSE_ISIN_LIST_URL, headers=BSE_HEADERS, timeout=30)
+        resp.raise_for_status()
+        payload = resp.json()
+    except (requests.RequestException, ValueError) as exc:
+        log.warning("BSE ISIN map download failed — continuing with isin=None: %s", exc)
+        return {}
+
+    # The endpoint returns a bare JSON array or wraps it under "Table" / "data".
+    rows: list[dict] = []
+    if isinstance(payload, list):
+        rows = payload
+    elif isinstance(payload, dict):
+        for key in ("Table", "data", "Data"):
+            if isinstance(payload.get(key), list):
+                rows = payload[key]
+                break
+
+    if not rows:
+        log.warning("BSE ISIN map: unexpected response shape — continuing with isin=None")
+        return {}
+
+    result: dict[str, str] = {}
+    for row in rows:
+        scrip = str(row.get("SCRIP_CD", "")).strip()
+        isin = str(row.get("ISIN_NUMBER", "")).strip()
+        if scrip and isin:
+            result[scrip] = isin
+
+    log.info("BSE ISIN map built: %d entries", len(result))
+    return result
+
+
+# ---------------------------------------------------------------------------
 # BSE fetcher
 # ---------------------------------------------------------------------------
 
@@ -113,6 +172,7 @@ def fetch_bse_page(
     scrip: str = "",
     search_type: str = "P",
     filing_type: str = "C",
+    bse_isin_map: dict[str, str] | None = None,
 ) -> tuple[list[dict], int]:
     """Fetch one page of BSE announcements.
 
@@ -126,6 +186,9 @@ def fetch_bse_page(
         scrip: BSE scrip code filter.
         search_type: 'P' for paginated, 'A' for date-range.
         filing_type: 'C' for company filings (default).
+        bse_isin_map: Optional ``{scrip_code: isin}`` map from
+            ``fetch_bse_isin_map``.  Passed through to ``parse_bse_response``
+            so each filing is annotated with its ISIN where available.
 
     Returns:
         Tuple of (list_of_filing_dicts, total_row_count).
@@ -149,7 +212,7 @@ def fetch_bse_page(
     )
     resp.raise_for_status()
     data = resp.json()
-    return parse_bse_response(data)
+    return parse_bse_response(data, bse_isin_map=bse_isin_map)
 
 
 # ---------------------------------------------------------------------------
@@ -407,6 +470,11 @@ def _crawl_bse(
     if from_date or to_date:
         log.info("BSE date filter: %s to %s", from_date or "start", to_date or "now")
 
+    # Build the scrip→ISIN lookup table once before crawling any pages.
+    # Falls back to empty dict on failure so the crawl continues with isin=None.
+    log.info("BSE: fetching ISIN lookup table…")
+    bse_isin_map = fetch_bse_isin_map(session)
+
     log_id = cache.log_crawl_start("bse", source="bse")
 
     try:
@@ -421,6 +489,7 @@ def _crawl_bse(
                     from_date=from_date,
                     to_date=to_date,
                     search_type=search_type,
+                    bse_isin_map=bse_isin_map,
                 )
             except (requests.RequestException, ValueError) as exc:
                 log.warning("BSE page %d fetch failed: %s — skipping", page_num, exc)

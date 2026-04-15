@@ -283,7 +283,10 @@ def build_bse_doc_url(row: dict) -> str:
     return base + attachment
 
 
-def parse_bse_response(data: dict) -> tuple[list[dict], int]:
+def parse_bse_response(
+    data: dict,
+    bse_isin_map: Optional[dict[str, str]] = None,
+) -> tuple[list[dict], int]:
     """Parse a BSE API JSON response into normalized filings.
 
     The BSE API returns:
@@ -291,6 +294,11 @@ def parse_bse_response(data: dict) -> tuple[list[dict], int]:
 
     Args:
         data: Parsed JSON response dict from the BSE API.
+        bse_isin_map: Optional ``{scrip_code: isin}`` dict built from the BSE
+            bulk equity list.  When provided, each filing's ``isin`` field is
+            populated via a dict lookup on ``SCRIP_CD``.  When ``None`` or when
+            the scrip code is absent from the map, ``isin`` remains ``None``
+            (backward-compatible behaviour).
 
     Returns:
         Tuple of (list_of_filing_dicts, total_row_count).
@@ -310,17 +318,21 @@ def parse_bse_response(data: dict) -> tuple[list[dict], int]:
         doc_url = build_bse_doc_url(row) if attachment else ""
 
         raw_date = (row.get("NEWS_DT") or "").strip()
+        scrip_code = str(row.get("SCRIP_CD") or "").strip()
+
+        # Resolve ISIN from the pre-built lookup map when available.
+        isin: Optional[str] = None
+        if bse_isin_map is not None and scrip_code:
+            isin = bse_isin_map.get(scrip_code)
+
         filings.append({
             "source": "bse",
             "filing_id": str(row.get("NEWSID") or ""),
             "company_name": (row.get("SLONGNAME") or "").strip(),
-            "ticker": str(row.get("SCRIP_CD") or "").strip(),
+            "ticker": scrip_code,
             # Keep legacy 'symbol' key for callers that still read it
-            "symbol": str(row.get("SCRIP_CD") or "").strip(),
-            # BSE API does not include ISIN in announcement responses.
-            # The scrip code (SCRIP_CD) is the BSE-specific numeric identifier.
-            # ISIN lookup requires a separate BSE company master API call.
-            "isin": None,
+            "symbol": scrip_code,
+            "isin": isin,
             "lei": None,
             "language": "en",
             "category": (row.get("CATEGORYNAME") or "").strip(),
